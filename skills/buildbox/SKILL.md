@@ -285,9 +285,12 @@ key is shown once, so have them paste the applicable lines into that safe enviro
 file as soon as they appear and keep the setup screen open. Ask them to share only the
 endpoint URL and variable names, which are non-secret, and to confirm that the
 applicable key line is in place without sharing its value. Never ask for the full paste
-block, the key, or the header value. If the key is lost or bad, stop. A fresh key must
-be issued by Buildbox support before setup can continue; there is no rotation button on
-the setup screen today.
+block, the key, or the header value. If the key is lost or bad, stop and have the
+customer check the environment file first, because a key that looks lost is usually a
+mis-pasted one. If it really is gone, they can issue a new one themselves: Integrations,
+then "Rotate ingest key", or the same action on the setup screen where the key is
+hidden. Rotating replaces the key at once and the old one stops working, so they paste
+the new lines in and restart the app before anything else.
 
 For a single trace backend, use these three standard lines with exactly these names.
 They apply on every route unless route 1 preserves an existing backend with the
@@ -388,8 +391,37 @@ Not when the code compiles. Not when a test span goes through. Done is:
 2. Have the customer perform **one real interaction** through the app: an actual chat, an
    actual agent run, the thing the app is for.
 3. Ask them to look at the Buildbox setup screen. It flips from "Waiting for your first
-   trace" to showing traces arriving.
-4. For a `full` connection, that setup probe only confirms trace arrival. After a few
+   trace" to showing traces arriving. This is the primary signal.
+4. Optionally, confirm the same thing from the machine you just instrumented. Buildbox
+   answers a read at the same endpoint with `/status` on the end, using the key already
+   in the environment. Give the customer the command for their route and have them run
+   it in the shell where the app's variables are loaded. Never type the key into it and
+   never ask them to read it back.
+
+   Standard path:
+
+   ```bash
+   key="${OTEL_EXPORTER_OTLP_TRACES_HEADERS##*Bearer%20}"
+   curl -sS -H "Authorization: Bearer ${key%%,*}" \
+     "$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT/status"
+   ```
+
+   Code-configured multi-backend path:
+
+   ```bash
+   curl -sS -H "Authorization: $BUILDBOX_OTLP_TRACES_AUTHORIZATION" \
+     "$BUILDBOX_OTLP_TRACES_ENDPOINT/status"
+   ```
+
+   The two commands differ because the two variables do: the standard one holds
+   `Authorization=Bearer%20<key>` for an SDK that baggage-parses it, and a curl header
+   needs the bare key after a literal space, so the substitution strips the prefix and
+   the encoding. The answer is
+   `{"first_trace_at": "2026-08-12T14:02:11+00:00", "spans_accepted": 128}`, or
+   `{"first_trace_at": null, "spans_accepted": 0}` when nothing has arrived yet. It
+   carries no secret, so the customer can paste the output straight back to you. A 401
+   means the key in that environment is not the live one; go to troubleshooting.
+5. For a `full` connection, both checks above only confirm trace arrival. After a few
    minutes, have the customer open Sessions from Home and check that the real interaction
    appears with turns before treating message capture as verified.
 
@@ -398,10 +430,27 @@ success from your side of the connection, and do not send a synthetic payload to
 screen move. A screen flipped by a fake span is a setup that will look connected and
 report nothing.
 
+### If this was a test, disconnect afterwards
+
+For a real customer the connection stays. That is the product, and there is nothing to
+clean up.
+
+When this skill is run as a TEST, on staging, against an internal workspace, or as a
+demo, the operator disconnects the connection when the test is over, from Settings in
+the Buildbox app. A test connection that is left behind is a real connection that will
+never receive another trace, and it goes on consuming worker scheduling until the
+fairness backoff decays it. Disconnecting is the only thing that removes it.
+
 ## Troubleshooting, in this order
 
 Work down the list. Each rung is more likely than the one after it, and the first two
 cost nothing to check.
+
+Run the status command from step 4 of the definition of done first if you have not
+already. It separates two cases that look alike: `spans_accepted` above zero means spans
+did reach Buildbox at some point and the problem is with what arrived, while a flat zero
+means nothing ever landed and the rungs below apply. A 429 means the status poller is
+running too fast; back off before retrying. A 401 from it is rung 3.
 
 1. **Exporter protocol.** On the standard path, is
    `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` set and reaching an
@@ -424,10 +473,12 @@ cost nothing to check.
    `OTEL_EXPORTER_OTLP_TRACES_HEADERS` themselves for `%20`. On the multi-backend path,
    have them check `BUILDBOX_OTLP_TRACES_AUTHORIZATION` themselves for a literal space
    and confirm that code passes it to the Buildbox exporter's `headers` option. Ask only
-   for confirmation that the format is correct, never for the line or its value. A fresh
-   key must be issued by Buildbox support before setup can continue; there is no
-   rotation button on the setup screen today. Stop here and do not print the key while
-   checking.
+   for confirmation that the format is correct, never for the line or its value. If the
+   line is wrong or the key is gone, the customer issues a new one themselves:
+   Integrations, then "Rotate ingest key", or the same action on the setup screen where
+   the key is hidden. Rotating replaces the key at once and the old one stops working,
+   so they paste the new lines in and restart the app before checking again. Stop here
+   and do not print the key while checking.
 
 4. **503 with a `Retry-After` header.** Buildbox has ingest paused for that workspace.
    Nothing is broken on the app side and OTel exporters queue and retry on their own.
