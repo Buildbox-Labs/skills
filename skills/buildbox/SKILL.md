@@ -139,9 +139,19 @@ For `ai` major 6 or lower, turn on the SDK's built-in telemetry at every model c
 const result = await generateText({
   model,
   prompt,
-  experimental_telemetry: { isEnabled: true },
+  experimental_telemetry: {
+    isEnabled: true,
+    metadata: { userId: user.id, sessionId: chat.id },
+  },
 });
 ```
+
+The `metadata` keys land on the span as `ai.telemetry.metadata.userId` and
+`ai.telemetry.metadata.sessionId`, and Buildbox reads exactly those two for user
+attribution and conversation grouping. For an AI SDK app this replaces the baggage
+setup in "Always, on every route": pass the app's own user id and its existing chat or
+thread id here on every call, and skip the baggage section. `userId` is replaced with a
+keyed hash before analysis, like `user.id`.
 
 The AI SDK emits into whatever OTel setup is registered in the process, so the app still
 needs a tracer provider. On Next.js that is `instrumentation.ts` with
@@ -161,12 +171,18 @@ registerTelemetry(new OpenTelemetry());
 const result = await generateText({
   model,
   prompt,
-  telemetry: { functionId: "agent" },
+  telemetry: {
+    functionId: "agent",
+    metadata: { userId: user.id, sessionId: chat.id },
+  },
 });
 ```
 
 Registration enables telemetry for all AI SDK calls by default in major 7. The
-`telemetry` option is only needed for metadata or to opt a call out.
+`telemetry` option is only needed for metadata or to opt a call out. Set the same
+`userId` and `sessionId` metadata keys as on the major-6 path, and for the same reason:
+Buildbox reads them for user attribution and conversation grouping, so an AI SDK app
+does not need the baggage setup.
 
 ### A running provider, first
 
@@ -370,7 +386,9 @@ Then copy the baggage value onto spans as an attribute, either with a span proce
 reads baggage on start, or by setting `gen_ai.conversation.id` explicitly on the spans you
 create. Use the id your app already has for a thread or a chat, not a new one.
 
-Single-shot agents with no follow-up turns can skip this.
+Single-shot agents with no follow-up turns can skip this. Vercel AI SDK apps can skip it
+too: the `metadata: { userId, sessionId }` telemetry option in route 2 carries both ids
+without any baggage code.
 
 **Suggest a user id.** If the app knows who is talking, set `user.id` on the same spans.
 Buildbox replaces it with a keyed hash before analysis. On a `full` connection, the raw
@@ -491,7 +509,17 @@ running too fast; back off before retrying. A 401 from it is rung 3.
    where that environment actually reads them from.
 
 6. **Spans exist but no conversations.** Traces arrive and every conversation is one turn
-   long: the conversation id is not propagating. Go back to the baggage section.
+   long: the conversation id is not propagating. Go back to the baggage section, or for
+   an AI SDK app, the `metadata` option in route 2.
+
+7. **Conversations arrive without message text on a `full` connection.** The instrumentor
+   is not capturing content, which is a producer setting, not a Buildbox one. The official
+   OTel GenAI instrumentations capture message content only when
+   `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` is set in the app's
+   environment. OpenInference and OpenLLMetry capture content by default, but both have
+   env switches that hide it, so if text is missing there, print the variable *names* in
+   the environment and look for their hide/trace-content settings. On the AI SDK path,
+   per-call `recordInputs`/`recordOutputs: false` disables capture for that call.
 
 ## Instrumentation packages
 
