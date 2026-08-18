@@ -1,6 +1,6 @@
 ---
 name: buildbox
-description: Connect a customer's AI agent to Buildbox agent analytics over OpenTelemetry. Use when someone asks to connect, set up, hook up, or send traces to Buildbox, or provides a Buildbox endpoint. Detects the framework, writes standard OTel config, and loops until a real interaction shows up on the Buildbox setup screen.
+description: Connect a customer's AI agent to Buildbox agent analytics over OpenTelemetry. Use when someone asks to connect, set up, hook up, or send traces to Buildbox, or provides a Buildbox endpoint or gives a Buildbox pairing code. Detects the framework, writes standard OTel config, and loops until a real interaction shows up on the Buildbox setup screen.
 ---
 
 # Connect an agent to Buildbox
@@ -27,40 +27,60 @@ through the running app shows up on the Buildbox setup screen.
   is the ingest key, which is ingest-only and scoped to one workspace.
 - **Never ask the customer to paste or reveal the ingest key or the full setup block.**
   Never print the key into source code, a commit, a log line, a terminal echo, or your
-  reply. The customer puts it into the app's environment file themselves and confirms
-  the key line is in place. It goes only into that file and, when needed, the deployment
-  platform's secret environment store.
+  reply. With a pairing code, `scripts/pair.mjs` writes the key into the app's
+  environment file and you never see it. Without one, the customer puts it there
+  themselves and confirms the key line is in place. It goes only into that file and, when
+  needed, the deployment platform's secret environment store.
+- **The pairing code is single-use and expires.** Use it only through
+  `scripts/pair.mjs`, and never print it or the key.
 
-## Step 1: collect the inputs
+## Step 1: detect, then ask only what detection could not settle
 
-Collect the first three non-secret app details up front, in one message. Use them to
-identify and secure the environment file before selecting the route. Do not ask the
-customer to open the Buildbox setup screen yet.
+Run the detector that ships with this skill. Run it from the customer's repo root, and
+spell out the script path from wherever the skill is installed, because the scripts scan
+and resolve paths against the directory you run them from, not against their own:
 
-1. **Which app.** In a monorepo, the path to the app that talks to the model, not the
-   repo root.
+```bash
+node <skill dir>/scripts/detect.mjs --json
+```
 
-2. **The AI entrypoint.** The file and function where the model call actually happens.
-   Ask, then confirm it against the code rather than guessing from folder names.
+Add `--dir <app path>` when the customer already named the app, and give the same kind of
+path to `--env-path` later: both are read relative to the directory you are in. The
+report carries the route and its evidence, plus `apps`, `entrypoints`, `restart`,
+`env_file`, and `env_file_safe`.
 
-3. **How the app restarts.** `pnpm dev`, `uvicorn --reload`, a Docker container, a
-   deploy. You need this for the verification loop, and it tells you where environment
-   variables actually come from.
+A field with one candidate is settled: take it and move on. Ask about the rest in one
+message, not four:
 
-4. **The safe environment file.** Identify the exact app environment file from the
-   framework convention and restart method. Complete the ignore, tracked-file, and any
-   needed untracking checks in "The env blocks" below now. Verify that the file is
-   ignored and untracked before continuing to step 2. The customer must not open the
-   setup screen or mint the key yet.
+1. **Which app**, when `apps` holds more than one candidate. In a monorepo this is the
+   app that talks to the model, not the repo root. Re-run with `--dir <app path>`.
+
+2. **The AI entrypoint**, when `entrypoints` is empty or lists several files. The file
+   and function where the model call actually happens. Confirm it against the code rather
+   than guessing from folder names.
+
+3. **How the app restarts**, when `restart` is null. `pnpm dev`, `uvicorn --reload`, a
+   Docker container, a deploy. You need this for the verification loop, and it tells you
+   where environment variables actually come from.
+
+4. **The environment file**, when `env_file` does not match how the app actually runs.
+
+Then make that file safe, before any key exists. `env_file_safe` reports where it stands:
+
+- `tracked: true` means the file is already committed. Stop and have the customer untrack
+  it, then run the detector again. An ignore rule does nothing for a file that is already
+  tracked, which is also why git reports such a file as not ignored.
+- `ignored: false` with `tracked: false` means the ignore pattern is missing. Add it to
+  `.gitignore`.
+- `checked: false` means git could not answer, not that the file is safe. Run the two
+  checks in "The env blocks" below by hand.
+
+Verify that the file is ignored and untracked before continuing to step 2. Do not ask the
+customer to open the Buildbox setup screen yet; with a pairing code they never have to.
 
 ## Step 2: pick the route
 
-Run the detector that ships beside this file, then read the code to confirm it. Paths are
-relative to this skill's own directory:
-
-```bash
-node scripts/detect.mjs --dir <app path>
-```
+Step 1 reported the route. Read the code to confirm it before you change anything.
 
 Take the **lightest route that applies**. A working exporter that is already there beats
 anything you add.
@@ -108,9 +128,10 @@ generic standard variables for traces, so adding the three standard Buildbox lin
 silently redirect the existing exporter away from the customer's current backend.
 
 If the customer wants to keep that backend, do not set any of the three standard
-Buildbox lines. Leave every standard `OTEL_EXPORTER_OTLP_*` variable untouched. Have the
-customer transpose the endpoint and authorization value from the private setup block
-into these dedicated variables in the app's environment file themselves:
+Buildbox lines. Leave every standard `OTEL_EXPORTER_OTLP_*` variable untouched. Use these
+dedicated variables in the app's environment file instead. With a pairing code, run
+`scripts/pair.mjs --dedicated` and it writes exactly these two. Without one, the customer
+transposes the endpoint and authorization value from the private setup block themselves:
 
 ```bash
 BUILDBOX_OTLP_TRACES_ENDPOINT=<endpoint URL from the setup screen>
@@ -131,7 +152,7 @@ Signals: the `ai` package in `package.json`, calls to `generateText`, `streamTex
 `generateObject`.
 
 Work: first read the installed `ai` major from the app's `package.json`, then use the
-matching recipe and have the customer confirm the standard env block is in place.
+matching recipe, then put the standard env block in place.
 
 For `ai` major 6 or lower, turn on the SDK's built-in telemetry at every model call:
 
@@ -224,8 +245,8 @@ await import("./app.js");
 
 Signals: `langchain`, `@langchain/core`, `@langchain/langgraph`, `langgraph`.
 
-Work: complete "A running provider, first", register a published instrumentor, then have
-the customer confirm the standard env block is in place. Buildbox reads both the
+Work: complete "A running provider, first", register a published instrumentor, then put the
+standard env block in place. Buildbox reads both the
 OpenInference and the OpenLLMetry conventions, so either one is fine. Pick whichever the
 customer already has; if neither, pick one and stay with it.
 
@@ -248,7 +269,7 @@ Signals: `openai`, `@openai/agents`, `openai-agents`, `@anthropic-ai/sdk`, `anth
 and no framework above them.
 
 Work: complete "A running provider, first", then add the matching instrumentor for that
-client and have the customer confirm the standard env block is in place. Same shape as
+client and put the standard env block in place. Same shape as
 route 3, different package: the OpenInference or OpenLLMetry instrumentation for OpenAI
 or Anthropic, registered once at startup. OpenAI Agents uses the matching instrumentor,
 `openinference-instrumentation-openai-agents`.
@@ -295,22 +316,61 @@ does not.
 
 ## The env blocks
 
-After the environment file is verified safe and the route is selected, tell the
-customer to open Buildbox: Setup, then Direct feed, then "Get my endpoint and key". The
-key is shown once, so have them paste the applicable lines into that safe environment
-file as soon as they appear and keep the setup screen open. Ask them to share only the
-endpoint URL and variable names, which are non-secret, and to confirm that the
-applicable key line is in place without sharing its value. Never ask for the full paste
-block, the key, or the header value. If the key is lost or bad, stop and have the
-customer check the environment file first, because a key that looks lost is usually a
-mis-pasted one. If it really is gone, they can issue a new one themselves: Integrations,
-then "Rotate ingest key", or the same action on the setup screen where the key is
-hidden. Rotating replaces the key at once and the old one stops working, so they paste
-the new lines in and restart the app before anything else.
+Once the environment file is verified safe and the route is selected, the variables can
+go in. There are two ways to get them, and the pairing path is the one to try first.
 
-For a single trace backend, use these three standard lines with exactly these names.
+### With a pairing code
+
+If the customer's prompt carried a pairing code, redeem it. The script sends the code to
+Buildbox, writes the lines it gets back into the environment file, and prints only the
+variable names and the status URL. You never see the key.
+
+```bash
+node <skill dir>/scripts/pair.mjs --code <the pairing code> \
+  --endpoint <the endpoint from the prompt> \
+  --env-path <app environment file>
+```
+
+Add `--dedicated` on the route-1 path where the customer keeps an existing trace backend.
+It writes the two `BUILDBOX_OTLP_TRACES_*` variables instead of the three standard ones,
+and the second-exporter code in route 1 reads those.
+
+The code works once and expires after fifteen minutes. Exit 3 means it is spent or
+expired and nothing was written: ask the customer to click "New command" on the Buildbox
+setup screen, then run the script again with the new code. Exit 2 and exit 4 also leave
+the code unspent, so the same code still works once the cause is fixed: exit 2 is a bad
+argument or an environment file the script cannot read or write, which it checks before
+it posts the code, and exit 4 means Buildbox could not be reached. Exit 6 is the one that
+costs a code: the code was redeemed and the write failed anyway, so the key is gone and
+the customer needs a new command. Never print the code or the key.
+
+Then read the four notes below. They are about what the lines mean and how each one fails
+silently, and they hold however the lines got there.
+
+### Without a pairing code
+
+If no code was given, the quickest fix is to get one: ask the customer to open Buildbox,
+then Setup, then Direct feed, click "Connect with my coding agent", and paste you the
+command it shows (the pairing code is not the key; it works once and expires). Then use
+the pairing path above. If they would rather paste the lines themselves, tell them to
+click "Get my endpoint and key" on the same screen. The key is shown once,
+so have them paste the applicable lines into that safe environment file as soon as they
+appear and keep the setup screen open. Ask them to share only the endpoint URL and
+variable names, which are non-secret, and to confirm that the applicable key line is in
+place without sharing its value. Never ask for the full paste block, the key, or the
+header value. If the key is lost or bad, stop and have the customer check the environment
+file first, because a key that looks lost is usually a mis-pasted one. If it really is
+gone, they can issue a new one themselves: Integrations, then "Rotate ingest key", or the
+same action on the setup screen where the key is hidden. Rotating replaces the key at
+once and the old one stops working, so they paste the new lines in and restart the app
+before anything else.
+
+### The lines themselves
+
+For a single trace backend, these are the three standard lines, with exactly these names.
 They apply on every route unless route 1 preserves an existing backend with the
-code-configured second exporter described above.
+code-configured second exporter described above. `pair.mjs` writes exactly these; a
+customer pasting by hand pastes exactly these.
 
 ```bash
 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=<endpoint URL from the setup screen>
@@ -342,20 +402,19 @@ single most common reason a setup looks finished and no traces arrive. Keep the
 trace-scoped name: an existing `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc` overrides a
 generic protocol setting.
 
-**Make the selected app's environment file safe before the key exists.** Identify the
-exact file that will supply the variables to the running app, using the framework's
-convention and the restart method collected in step 1. A Next.js run may take them from
-`.env.local` or `.env.production`, dotenv defaults to `.env`, and a container may
-declare an `env_file`. Use `<app environment file>` below for that exact repo-relative
-path. From the repo root, run
+**Make the selected app's environment file safe before the key exists.** This is the file
+step 1 settled: the one that will supply the variables to the running app. A Next.js run
+may take them from `.env.local` or `.env.production`, dotenv defaults to `.env`, and a
+container may declare an `env_file`. Use `<app environment file>` below for that exact
+repo-relative path. From the repo root, run
 `git check-ignore --quiet -- <app environment file>` to confirm that exact file is
 ignored. If it is not, add the applicable pattern to `.gitignore`. Then run
 `git ls-files --error-unmatch -- <app environment file>` from the repo root. Exit 0
 means the app's environment file is already tracked, so stop and have the customer
 untrack it. Re-run both checks and verify that the file is ignored and untracked before
-the customer opens the setup screen or mints the key. Only then have the customer put
-the applicable key lines in that file themselves. Do not write or inspect the key line
-yourself. For the code-configured multi-backend path, the applicable key lines are
+any key exists. Only then redeem the pairing code, or, with no code, have the customer
+put the applicable key lines in that file themselves. Either way you do not read the key
+line back. For the code-configured multi-backend path, the applicable key lines are
 `BUILDBOX_OTLP_TRACES_ENDPOINT` and `BUILDBOX_OTLP_TRACES_AUTHORIZATION`; the three
 standard lines must remain unset for Buildbox. If the app deploys somewhere, set the
 applicable variables in that environment too; a local environment file does not reach a
@@ -404,49 +463,41 @@ it off. A custom key nobody reads is noise in the customer's trace bill.
 
 Not when the code compiles. Not when a test span goes through. Done is:
 
-1. Restart the app so it picks up the new environment and code. Confirm the process
-   really restarted; a hot reloader often does not re-read the app's environment file.
-2. Have the customer perform **one real interaction** through the app: an actual chat, an
-   actual agent run, the thing the app is for.
-3. Ask them to look at the Buildbox setup screen. It flips from "Waiting for your first
-   trace" to showing traces arriving. This is the primary signal.
-4. Optionally, confirm the same thing from the machine you just instrumented. Buildbox
-   answers a read at the same endpoint with `/status` on the end, using the key already
-   in the environment. Give the customer the command for their route and have them run
-   it in the shell where the app's variables are loaded. Never type the key into it and
-   never ask them to read it back.
-
-   Standard path:
+1. **Restart the app yourself** when the restart command is a local one. Run it, then
+   confirm the process really restarted; a hot reloader often does not re-read the app's
+   environment file. When the app only runs somewhere you cannot reach, ask the customer
+   to restart it.
+2. **Perform one real interaction yourself**, through the app's real entrypoint: an HTTP
+   call to the chat route, or a browser tool against the local UI. Against a local or
+   staging instance only, never production. If you can reach neither, ask the customer to
+   do it: an actual chat, an actual agent run, the thing the app is for. A request through
+   the app's real code path is the interaction; a hand-made span is not.
+3. **Wait for the span to land.**
 
    ```bash
-   key="${OTEL_EXPORTER_OTLP_TRACES_HEADERS##*Bearer%20}"
-   curl -sS -H "Authorization: Bearer ${key%%,*}" \
-     "$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT/status"
+   node <skill dir>/scripts/status.mjs --env-path <app environment file> --wait 90
    ```
 
-   Code-configured multi-backend path:
-
-   ```bash
-   curl -sS -H "Authorization: $BUILDBOX_OTLP_TRACES_AUTHORIZATION" \
-     "$BUILDBOX_OTLP_TRACES_ENDPOINT/status"
-   ```
-
-   The two commands differ because the two variables do: the standard one holds
-   `Authorization=Bearer%20<key>` for an SDK that baggage-parses it, and a curl header
-   needs the bare key after a literal space, so the substitution strips the prefix and
-   the encoding. The answer is
-   `{"first_trace_at": "2026-08-12T14:02:11+00:00", "spans_accepted": 128}`, or
-   `{"first_trace_at": null, "spans_accepted": 0}` when nothing has arrived yet. It
-   carries no secret, so the customer can paste the output straight back to you. A 401
-   means the key in that environment is not the live one; go to troubleshooting.
+   It reads the endpoint and the key out of the environment file, asks Buildbox, and
+   prints the answer:
+   `{"first_trace_at": "2026-08-17T14:02:11+00:00", "spans_accepted": 128}`, or
+   `{"first_trace_at": null, "spans_accepted": 0}` when nothing has arrived yet. The
+   answer carries no secret. Exit 0 means spans arrived. Exit 1 means still nothing after
+   the wait, so go to troubleshooting. Exit 5 means the key in the file is not the live
+   one, which is rung 3.
+4. **The setup screen is the customer's signal.** Once the status read is green, point
+   them at it: it flips from "Waiting for your first trace" to showing traces arriving.
 5. For a `full` connection, both checks above only confirm trace arrival. After a few
    minutes, have the customer open Sessions from Home and check that the real interaction
    appears with turns before treating message capture as verified.
 
-If the screen still says waiting after a minute, go to troubleshooting. Do not declare
-success from your side of the connection, and do not send a synthetic payload to make the
-screen move. A screen flipped by a fake span is a setup that will look connected and
-report nothing.
+The deploy stays with the customer, and so does the decision to make it. Say which
+variables go where: the ones now in the local environment file have to be set again in the
+deployment platform's secret store before production traffic reaches Buildbox.
+
+Do not declare success from your side of the connection, and do not send a synthetic
+payload to make the screen move. A screen flipped by a fake span is a setup that will look
+connected and report nothing.
 
 ### If this was a test, disconnect afterwards
 
@@ -464,11 +515,17 @@ fairness backoff decays it. Disconnecting is the only thing that removes it.
 Work down the list. Each rung is more likely than the one after it, and the first two
 cost nothing to check.
 
-Run the status command from step 4 of the definition of done first if you have not
-already. It separates two cases that look alike: `spans_accepted` above zero means spans
-did reach Buildbox at some point and the problem is with what arrived, while a flat zero
-means nothing ever landed and the rungs below apply. A 429 means the status poller is
-running too fast; back off before retrying. A 401 from it is rung 3.
+Run `scripts/status.mjs` first if you have not already. It separates two cases that look
+alike: `spans_accepted` above zero means spans did reach Buildbox at some point and the
+problem is with what arrived, while a flat zero means nothing ever landed and the rungs
+below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 is rung 3.
+
+0. **`pair.mjs` exited 3.** The pairing code is spent or expired: codes work once and last
+   fifteen minutes. Nothing was written and nothing is wrong with the app. Ask the
+   customer to click "New command" on the Buildbox setup screen, then run `pair.mjs`
+   again with the new code. Exit 6 reads the same way from the customer's side, but for a
+   different reason: the code was redeemed and the environment file could not be written,
+   so fix the file permissions the message names before asking for the new command.
 
 1. **Exporter protocol.** On the standard path, is
    `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` set and reaching an
@@ -492,11 +549,12 @@ running too fast; back off before retrying. A 401 from it is rung 3.
    have them check `BUILDBOX_OTLP_TRACES_AUTHORIZATION` themselves for a literal space
    and confirm that code passes it to the Buildbox exporter's `headers` option. Ask only
    for confirmation that the format is correct, never for the line or its value. If the
-   line is wrong or the key is gone, the customer issues a new one themselves:
-   Integrations, then "Rotate ingest key", or the same action on the setup screen where
-   the key is hidden. Rotating replaces the key at once and the old one stops working,
-   so they paste the new lines in and restart the app before checking again. Stop here
-   and do not print the key while checking.
+   line is wrong or the key is gone, the quickest fix on the pairing path is a new code:
+   the customer clicks "New command", and `pair.mjs` overwrites the lines in place.
+   Otherwise the customer issues a new key themselves: Integrations, then "Rotate ingest
+   key", or the same action on the setup screen where the key is hidden. Either way the
+   old key stops working at once, so the new lines go in and the app restarts before
+   checking again. Stop here and do not print the key while checking.
 
 4. **503 with a `Retry-After` header.** Buildbox has ingest paused for that workspace.
    Nothing is broken on the app side and OTel exporters queue and retry on their own.
@@ -539,16 +597,57 @@ instrumentor's own README before rewriting it.
   `@opentelemetry/sdk-node` and `@opentelemetry/exporter-trace-otlp-proto` (Node),
   `@vercel/otel` on Next.js.
 
-## Script helper
+## Script helpers
 
-`scripts/detect.mjs`, in this skill's directory, reads the target directory's
-`package.json`, `pyproject.toml`, and `requirements.txt` and reports which route applies.
+Three scripts ship in this skill's `scripts/` directory. All three are plain Node with no
+dependencies, and none of them prints the ingest key or the pairing code.
+
+**`detect.mjs`** reads the app's `package.json`, `pyproject.toml`, and `requirements.txt`
+and reports which route applies, plus the facts step 1 would otherwise have to ask for.
 
 ```bash
-node scripts/detect.mjs --dir ./apps/agent
-node scripts/detect.mjs --dir ./apps/agent --json
+node <skill dir>/scripts/detect.mjs --json
+node <skill dir>/scripts/detect.mjs --dir ./apps/agent --json
 ```
 
-`--json` prints `{route, framework, evidence}`. It reads files only: no network, no
-writes. It is a starting point, not a verdict. Confirm the route against the entrypoint
-before you edit anything.
+`--json` prints `{route, framework, evidence, app, apps, entrypoints, restart, env_file,
+env_file_safe}`. It reads files only: no network, no writes. It is a starting point, not
+a verdict. Confirm the route against the entrypoint before you edit anything.
+
+**`pair.mjs`** redeems a pairing code and writes the environment lines it gets back.
+
+```bash
+node <skill dir>/scripts/pair.mjs --code <code> --endpoint <endpoint> \
+  --env-path <file> [--dedicated]
+```
+
+It creates the file with owner-only permissions when it is missing, and leaves the
+permissions alone on a file that is already there, warning once if other users can read
+it. It replaces a variable already in the file where it stands, keeping any `export`
+prefix, drops later duplicate lines for the same variable, and appends the rest. It prints
+the variable names it wrote and the status URL, nothing else. Exit 3 means the code is
+spent or expired, exit 4 means Buildbox could not be reached, exit 2 means the arguments
+were wrong or the environment file cannot be read or written. On all three nothing was
+written and the code is still good. Exit 6 is the exception: the code was redeemed and the
+write failed, so the key is gone and the customer needs a new command. The endpoint has to
+be https, or http on localhost for a developer's own machine.
+
+**`status.mjs`** asks Buildbox whether the spans arrived, using the key already in the
+environment file.
+
+```bash
+node <skill dir>/scripts/status.mjs --env-path <file> --wait 90
+```
+
+It reads either variable form, the three standard `OTEL_` lines or the two dedicated
+`BUILDBOX_` ones, and it holds the endpoint to the same https rule. Exit 0 means spans
+have arrived, 1 means none yet, 5 means the key was rejected, 4 means Buildbox could not
+be reached or would not answer within the wait (a rate limit longer than `--wait` is
+reported this way, with the seconds to hold off; it says nothing about whether spans
+arrived), 2 means the file had no Buildbox variables or an endpoint the script will not
+call. Add `--wait 0` for a single read, `--interval <seconds>` to poll at a different
+pace.
+
+The path flag is `--env-path`, not `--env-file`, in both scripts: node reads an
+`--env-file` argument itself wherever it appears on the command line, and quits before the
+script runs when that file does not exist yet.
