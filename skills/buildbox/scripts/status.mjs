@@ -4,7 +4,7 @@
 // and is never printed.
 //
 //   node status.mjs --env-path ./apps/agent/.env.local [--wait 90] [--interval 5]
-//     [--baseline 3 [--new-conversations 1] [--settle 20]]
+//     [--baseline 3 [--new-conversations 1] [--settle 30]]
 //
 // The path flag is --env-path, not --env-file: node reads --env-file itself,
 // wherever it appears on the command line. --env-file is still accepted.
@@ -21,17 +21,25 @@
 // spans_accepted, so that number can go green on a setup with no model
 // telemetry and no conversation grouping at all.
 //
-// Once the count reaches n + k the check keeps reading for --settle <seconds>,
-// 20 by default. A count that climbs past n + k inside that window means the
-// turns were split into separate conversations, which is broken grouping, so
-// that exits 1 rather than 0.
+// Once the count first reaches n + k the check keeps reading for --settle
+// <seconds>, 30 by default, and judges the read that closes that window rather
+// than the first read above the target. The count is not monotonic while
+// Buildbox is still assembling: it climbs by one and merges back down within
+// about a minute, so a single high read says nothing. Only an overshoot that
+// survives the window is broken grouping.
 //
-// Exit codes: 0 spans have arrived, and the conversation delta was met and held
-// when one was asked for, 1 still nothing when the wait ran out, or the delta
-// was never reached, or more conversations arrived than turns were sent, 2 bad
-// arguments, no Buildbox variables in the file, an endpoint that is not https,
-// or a baseline too close to the count's cap for a delta to prove anything, 4
-// Buildbox could not be reached, 5 the key was rejected.
+// At the close: still climbing, meaning the closing read is above the one
+// before it, extends the window once more; equal to the target exits 0; above
+// the target exits 1; below the target means the count merged back down, so the
+// run goes back to waiting for it inside the remaining --wait. Worst case is
+// --wait plus two settle windows.
+//
+// Exit codes: 0 spans have arrived, and the conversation delta was met and
+// settled when one was asked for, 1 still nothing when the wait ran out, or the
+// delta was never reached, or the count settled above it, 2 bad arguments, no
+// Buildbox variables in the file, an endpoint that is not https, or a baseline
+// too close to the count's cap for a delta to prove anything, 4 Buildbox could
+// not be reached, 5 the key was rejected.
 import { readFileSync } from "node:fs";
 
 const USAGE =
@@ -52,7 +60,7 @@ const argv = process.argv.slice(2);
 let envFile = null;
 let wait = 90;
 let interval = 5;
-let settle = 20;
+let settle = 30;
 let baseline = null;
 let newConversations = null;
 for (let i = 0; i < argv.length; i++) {
@@ -221,13 +229,32 @@ function finish(code, message) {
 }
 
 const overshot = (seen) =>
-  `conversations_seen reached ${seen}, past the ${target} this run expected ` +
+  `conversations_seen settled at ${seen}` +
+  (peak !== null && peak > seen ? `, after a peak of ${peak}` : "") +
+  `, past the ${target} this run expected ` +
   `(baseline ${baseline} plus ${expected}): more conversations than turns you sent under one ` +
   "conversation id, so the grouping is broken. Check troubleshooting rung 6.";
 
 // Set when the target is first reached: from then on the run is holding the
 // count still rather than waiting for it to rise.
 let settleUntil = null;
+// One extension per settle window, spent when the count is still climbing as
+// the window closes.
+let extended = false;
+// The read before the current one, inside the window, and the highest count
+// this run has seen. The peak is worth reporting because a transient split is
+// the normal reason a run sees one.
+let previousSeen = null;
+let peak = null;
+
+/** Print the in-window line and wait, but never past the end of the window: a
+ *  window that never reads again would pass a split conversation exactly the
+ *  way a floor did. */
+async function holdInWindow(seen) {
+  console.error(`settling, conversations_seen: ${seen}`);
+  const left = Math.max((settleUntil - Date.now()) / 1000, 0.001);
+  await sleep(Math.min(interval, left));
+}
 
 for (;;) {
   let note = "waiting";
@@ -277,25 +304,54 @@ for (;;) {
             "conversation check could not run. Read the grouping off the Sessions screen instead.",
         );
       }
-      // Above the target, whenever it shows up, is the failure this check is
-      // for: the turns landed as separate conversations.
-      if (seen > target) finish(1, overshot(seen));
-      if (settleUntil === null && seen === target) {
-        if (settle <= 0) finish(0, `arrived, conversations_seen: ${seen}`);
-        settleUntil = Date.now() + settle * 1000;
-      } else if (settleUntil !== null && Date.now() >= settleUntil) {
-        finish(0, `arrived, conversations_seen: ${seen}`);
-      }
-      if (settleUntil !== null) {
-        // Always read at least once more inside the window, whatever --interval
-        // says: a settle window that never reads again would pass a split
-        // conversation exactly the way a floor did.
-        const left = Math.max((settleUntil - Date.now()) / 1000, 0.001);
-        console.error(`settling, conversations_seen: ${seen}`);
-        await sleep(Math.min(interval, left));
+      if (peak === null || seen > peak) peak = seen;
+      if (settleUntil === null) {
+        // Reaching the target, or passing it, opens the settle window. A first
+        // read above the target is not the verdict: the count over-counts
+        // transiently while batches are still being merged.
+        if (seen >= target) {
+          // A single read (--wait 0) or no settle window asked for: the first
+          // read is the verdict, because there is nothing to hold for.
+          if (settle <= 0 || wait <= 0) {
+            if (seen === target) finish(0, `arrived, conversations_seen: ${seen}`);
+            finish(1, overshot(seen));
+          }
+          settleUntil = Date.now() + settle * 1000;
+          extended = false;
+          previousSeen = seen;
+          await holdInWindow(seen);
+          continue;
+        }
+        note = `waiting, conversations_seen: ${seen}`;
+      } else if (Date.now() < settleUntil) {
+        previousSeen = seen;
+        await holdInWindow(seen);
         continue;
+      } else if (seen > previousSeen && !extended) {
+        // Still climbing as the window closes, so assembly is not finished and
+        // there is nothing to judge yet. This arm comes before the verdicts on
+        // purpose: a count above the target that is still moving is exactly the
+        // case the extension exists for, and judging first would make it dead
+        // code.
+        extended = true;
+        settleUntil = Date.now() + settle * 1000;
+        previousSeen = seen;
+        await holdInWindow(seen);
+        continue;
+      } else if (seen === target) {
+        finish(0, `arrived, conversations_seen: ${seen}`);
+      } else if (seen > target) {
+        // An overshoot that survived the window: the turns landed as separate
+        // conversations, which is the failure this check is for.
+        finish(1, overshot(seen));
+      } else {
+        // Merged back below the target, so it was never settled. Go back to
+        // waiting for it inside whatever is left of --wait.
+        settleUntil = null;
+        extended = false;
+        previousSeen = null;
+        note = `waiting, conversations_seen: ${seen}`;
       }
-      note = `waiting, conversations_seen: ${seen}`;
     }
   } else if (Date.now() + interval * 1000 > deadline) {
     fail(4, `Buildbox answered ${response.status} to the status read.`);

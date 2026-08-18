@@ -248,7 +248,10 @@ option, `generateText({ context: {...} })`, names its attributes
 
 On major 7 the `enrichSpan` closure is what carries the ids, so a major-7 AI SDK app that
 skips it has no conversation grouping at all. Either set it on every call, or do the
-baggage setup in "Always, on every route" instead. Do not skip both.
+baggage setup in "Always, on every route" instead. Do not skip both, and do not do both:
+`enrichSpan` on every call is the whole of grouping and user attribution for an AI SDK
+app, so adding the baggage span processor on top of it buys nothing and leaves the
+customer a dependency and a processor they will maintain forever.
 
 `next dev` runs Turbopack, which does not typecheck. After editing the entrypoint, run
 `next build` or `tsc --noEmit` before you call the edit done: a wrong telemetry option
@@ -641,9 +644,14 @@ Not when the code compiles. Not when a test span goes through. Done is:
    only a process you started, or the app's own process on its port, and never a bare
    pattern kill: on a machine where the customer already had the app up, that takes down
    something you did not put there. Then run the restart and confirm the process really
-   restarted; a hot reloader often does not re-read the app's environment file. When the
-   app only runs somewhere you cannot reach, ask the customer to restart it. Leave the app
-   in the state you found it or running, and say in your summary which one.
+   restarted, from its own startup line in the log or with `lsof -i :<port>`, and not with
+   an HTTP request: a hot reloader often does not re-read the app's environment file, and
+   from here to the end of step 4 the app has to stay quiet, so a `curl /` readiness probe
+   is a request like any other. When the app only runs somewhere you cannot reach, ask the
+   customer to restart it. Leave the app in the state you found it or running, and say in
+   your summary which one. If you started it as a background task in a headless session,
+   say that too, and give the customer the one command that brings it up in their own
+   terminal.
 3. **Read the conversation baseline, then perform one real interaction yourself, two
    turns under one conversation id.** The baseline first, because the check in step 4 is
    a delta and the number has to come from before the turns:
@@ -655,6 +663,14 @@ Not when the code compiles. Not when a test span goes through. Done is:
    That reads once and stops. Expect exit 1, and `conversations_seen` 0, on a connection
    that has never received anything. Keep the `conversations_seen` number it prints.
 
+   Between this reading and the check in step 4, send the app nothing but the two turns
+   below. No health probes, no stray page loads, and no browser tab left sitting on the app
+   before or after them: if you drive the UI with a browser tool, close the tab once the two
+   turns are done. An app with HTTP auto-instrumentation traces every request, so anything
+   beyond the turns themselves is a model-free trace. Buildbox no longer counts a trace with
+   no turns in it as a conversation, but a customer on an older Buildbox still does, and
+   either way a quiet app is what makes the settle window in step 4 mean anything.
+
    Then the interaction, through the app's real entrypoint: an HTTP call to the chat
    route, or a browser tool against the local UI. Against a local or staging instance
    only, never production. Two turns, not one, and both carrying the same conversation
@@ -663,6 +679,11 @@ Not when the code compiles. Not when a test span goes through. Done is:
    reach neither, ask the customer to do it: an actual chat, an actual agent run, the
    thing the app is for. A request through the app's real code path is the interaction; a
    hand-made span is not.
+
+   Use a placeholder identity for your own turns, `user_id: setup-check-user` or whatever
+   the app's field is called, and never a real person's email address or account. These
+   turns are yours, not a customer's, and that value is what Buildbox hashes and attributes
+   the conversation to.
 4. **Wait for the conversation to land**, not just a span. After the two turns:
 
    ```bash
@@ -672,14 +693,23 @@ Not when the code compiles. Not when a test span goes through. Done is:
 
    `--baseline <n>` is that reading from before the interaction, and `--new-conversations
    <k>` is one per conversation id you sent, so two turns under one id is
-   `--new-conversations 1`. The check waits for `conversations_seen` to reach n + k, and
-   then keeps reading for a settle window, `--settle` seconds, 20 by default, to see
-   whether it stops there. An overshoot, a count past n + k on the first read or any read
-   inside that window, means more conversations arrived than turns you sent, so the turns
-   were split instead of grouped, and that exits 1 rather than passing. Allow up to the
-   wait plus the settle window for the answer. A plain floor like "at least one
-   conversation" would pass both failures on a connection that already had conversations,
-   which is why the check is a delta.
+   `--new-conversations 1`. The check waits for `conversations_seen` to first reach n + k,
+   then keeps reading for a settle window, `--settle` seconds, 30 by default, and judges
+   the read that closes that window rather than the first read above the target. The count
+   is not monotonic while Buildbox is still assembling a batch: it can climb by one and
+   merge back down within about a minute. Settling on n + k passes. Settling above it means
+   more conversations arrived than turns you sent, so the turns were split instead of
+   grouped, and that exits 1, reporting both the peak and the settled value. A count still
+   climbing when the window closes buys one more window, and a count that has merged back
+   under n + k puts the run back to waiting inside `--wait`. Allow up to the wait plus two
+   settle windows for the answer. A plain floor like "at least one conversation" would pass
+   both failures on a connection that already had conversations, which is why the check is
+   a delta.
+
+   If this exits 1, wait 60 seconds and run the same command again, same baseline, before
+   you touch any code. Do not send more turns: repeating the interaction adds conversations
+   and moves the target out from under the baseline you already have. A split that clears
+   on the second run was assembly catching up. Only a second failure is rung 6.
 
    It reads the endpoint and the key out of the environment file, asks Buildbox, and
    prints the answer:
@@ -687,12 +717,12 @@ Not when the code compiles. Not when a test span goes through. Done is:
    "conversations_seen": 1}`, or
    `{"first_trace_at": null, "spans_accepted": 0, "conversations_seen": 0}` when nothing
    has arrived yet. The answer carries no secret. Exit 0 means spans arrived and the delta
-   was met and held. Exit 1 means still nothing after the wait, or the delta never
-   arrived, or the count overshot it, and its message says which: all three conversation
-   cases are rung 6, not a missing exporter. Exit 2 when the baseline plus the expected
-   conversations reaches the count's 1000 cap means there is no exact number to measure a
-   delta against, so read the grouping off the Sessions screen instead. Exit 5 means the
-   key in the file is not the live one, which is rung 3.
+   was met and settled. Exit 1 means still nothing after the wait, or the delta never
+   arrived, or the count settled above it, and its message says which: all three
+   conversation cases are rung 6, not a missing exporter. Exit 2 when the baseline plus the
+   expected conversations reaches the count's 1000 cap means there is no exact number to
+   measure a delta against, so read the grouping off the Sessions screen instead. Exit 5
+   means the key in the file is not the live one, which is rung 3.
 
    Spans arriving is not the same as the setup working. On Next.js, `@vercel/otel`'s HTTP
    spans count towards `spans_accepted`, so that number can go green on an app with no
@@ -790,10 +820,12 @@ below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 
    where that environment actually reads them from.
 
 6. **Spans exist but the conversations do not.** `status.mjs --baseline` exits 1 with
-   spans accepted, either because the delta never arrived or because the count overshot
-   it, or traces arrive and every conversation is one turn long: the conversation id is
-   not propagating. An overshoot is that same failure caught earlier, one conversation per
-   turn instead of one per id. Go back to the baggage section, or for an AI SDK app, to
+   spans accepted, either because the delta never arrived or because the count settled
+   above it, or traces arrive and every conversation is one turn long: the conversation id
+   is not propagating. A settled overshoot is that same failure caught earlier, one
+   conversation per turn instead of one per id. A single high read is not, which is why the
+   check judges the settled value and why you re-run it once before coming here. Go back to
+   the baggage section, or for an AI SDK app, to
    the route 2 recipe for the installed major, the per-call `enrichSpan` on major 7 and
    the `metadata` option on major 6. On Next.js, check that the spans are model-call spans
    at all and not just `@vercel/otel`'s HTTP spans, which is the same failure one step
@@ -884,8 +916,8 @@ node <skill dir>/scripts/status.mjs --env-path <file> --wait 90 --baseline 3 \
 
 It reads either variable form, the three standard `OTEL_` lines or the two dedicated
 `BUILDBOX_` ones, and it holds the endpoint to the same https rule. Exit 0 means spans
-have arrived, and the conversation delta was met and held when one was asked for. Exit 1
-means none yet, or the delta was not met, or more conversations arrived than turns were
+have arrived, and the conversation delta was met and settled when one was asked for. Exit
+1 means none yet, or the delta was not met, or more conversations arrived than turns were
 sent. Exit 5 means the key was rejected, 4 means Buildbox could not be reached or would
 not answer within the wait (a rate limit longer than `--wait` is reported this way, with
 the seconds to hold off; it says nothing about whether spans arrived), 2 means the file
@@ -894,10 +926,15 @@ single read, `--interval <seconds>` to poll at a different pace.
 
 `--baseline <n>` turns the read into a delta check around one interaction: n is the
 `conversations_seen` value read before the interaction, and the run waits for the count to
-reach n plus `--new-conversations <k>`, one by default and one per conversation id sent.
-Then it holds for `--settle <seconds>`, 20 by default, and a count that climbs past n + k
-in that window exits 1, because more conversations than turns means the turns were split
-rather than grouped. A floor would pass both failures on a connection that already had
+first reach n plus `--new-conversations <k>`, one by default and one per conversation id
+sent. Then it holds for `--settle <seconds>`, 30 by default, and judges the read that
+closes the window, not the first read above n + k: the count over-counts transiently while
+Buildbox merges batches, so one high read proves nothing. Settled on n + k exits 0.
+Settled above it exits 1 and names the peak and the settled value, because more
+conversations than turns means the turns were split rather than grouped. Still climbing at
+the close extends the window once, and a count back under n + k returns the run to waiting
+inside `--wait`, so the longest a check can take is the wait plus two settle windows.
+A floor would pass both failures on a connection that already had
 conversations, and `spans_accepted` alone goes green on a Next.js app whose only spans are
 HTTP spans. An older Buildbox does not return `conversations_seen` at all, and the script
 says so and exits 1 rather than reading the absence as zero, because zero would send you
