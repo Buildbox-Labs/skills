@@ -4,6 +4,7 @@
 // and is never printed.
 //
 //   node status.mjs --env-path ./apps/agent/.env.local [--wait 90] [--interval 5]
+//     [--baseline 3 [--new-conversations 1] [--settle 20]]
 //
 // The path flag is --env-path, not --env-file: node reads --env-file itself,
 // wherever it appears on the command line. --env-file is still accepted.
@@ -11,12 +12,36 @@
 // --wait 0 reads once and stops. Otherwise it polls until spans arrive or the
 // wait runs out, backing off when Buildbox asks it to.
 //
-// Exit codes: 0 spans have arrived, 1 still nothing when the wait ran out,
-// 2 bad arguments, no Buildbox variables in the file, or an endpoint that is
-// not https, 4 Buildbox could not be reached, 5 the key was rejected.
+// --baseline <n> turns the read into a delta check around one interaction: n is
+// the conversations_seen value read before the interaction, and the check waits
+// for the count to reach n plus --new-conversations <k>, which is one by
+// default and is one per conversation id sent. A floor like "at least one
+// conversation" proves nothing on a connection that already had conversations,
+// and spans alone are weaker still: a Next.js app's HTTP spans count towards
+// spans_accepted, so that number can go green on a setup with no model
+// telemetry and no conversation grouping at all.
+//
+// Once the count reaches n + k the check keeps reading for --settle <seconds>,
+// 20 by default. A count that climbs past n + k inside that window means the
+// turns were split into separate conversations, which is broken grouping, so
+// that exits 1 rather than 0.
+//
+// Exit codes: 0 spans have arrived, and the conversation delta was met and held
+// when one was asked for, 1 still nothing when the wait ran out, or the delta
+// was never reached, or more conversations arrived than turns were sent, 2 bad
+// arguments, no Buildbox variables in the file, an endpoint that is not https,
+// or a baseline too close to the count's cap for a delta to prove anything, 4
+// Buildbox could not be reached, 5 the key was rejected.
 import { readFileSync } from "node:fs";
 
-const USAGE = "usage: node status.mjs --env-path <path> [--wait <seconds>] [--interval <seconds>]";
+const USAGE =
+  "usage: node status.mjs --env-path <path> [--wait <seconds>] [--interval <seconds>] " +
+  "[--baseline <n> [--new-conversations <k>] [--settle <seconds>]]";
+
+// The status read counts conversations up to 1000 and answers 1000 for "1000 or
+// more", so a baseline at the cap is not a number to measure a delta from: it
+// cannot be told apart from any larger one.
+const CONVERSATIONS_CAP = 1000;
 
 function fail(code, message) {
   console.error(message);
@@ -27,6 +52,9 @@ const argv = process.argv.slice(2);
 let envFile = null;
 let wait = 90;
 let interval = 5;
+let settle = 20;
+let baseline = null;
+let newConversations = null;
 for (let i = 0; i < argv.length; i++) {
   const flag = argv[i];
   const value = argv[i + 1];
@@ -34,10 +62,24 @@ for (let i = 0; i < argv.length; i++) {
     if (!value || value.startsWith("--")) fail(2, USAGE);
     envFile = value;
     i++;
-  } else if (flag === "--wait" || flag === "--interval") {
+  } else if (flag === "--baseline" || flag === "--new-conversations") {
+    const count = Number(value);
+    if (!Number.isInteger(count)) fail(2, USAGE);
+    if (flag === "--baseline") {
+      if (count < 0) fail(2, USAGE);
+      baseline = count;
+    } else {
+      // Zero new conversations would make the target the baseline itself, which
+      // is the floor this flag exists to replace.
+      if (count < 1) fail(2, USAGE);
+      newConversations = count;
+    }
+    i++;
+  } else if (flag === "--wait" || flag === "--interval" || flag === "--settle") {
     const seconds = Number(value);
     if (!Number.isFinite(seconds) || seconds < 0) fail(2, USAGE);
     if (flag === "--wait") wait = seconds;
+    else if (flag === "--settle") settle = seconds;
     else interval = seconds;
     i++;
   } else {
@@ -46,6 +88,29 @@ for (let i = 0; i < argv.length; i++) {
 }
 if (!envFile) fail(2, USAGE);
 if (interval <= 0) interval = 5;
+if (newConversations !== null && baseline === null) {
+  fail(
+    2,
+    "--new-conversations needs --baseline <n>, the conversations_seen value read " +
+      `before the interaction.\n${USAGE}`,
+  );
+}
+
+// How many new conversations this run is waiting for, and the count that means
+// it got them. Null target is the plain read: spans arrived, nothing more.
+const expected = newConversations ?? 1;
+const target = baseline === null ? null : baseline + expected;
+// The target itself has to sit below the cap: a target of exactly the cap reads
+// the same whether one conversation arrived or ten, so an overshoot there is
+// invisible and the check would pass a broken grouping.
+if (target !== null && target >= CONVERSATIONS_CAP) {
+  fail(
+    2,
+    `conversations_seen is counted up to ${CONVERSATIONS_CAP} and ${CONVERSATIONS_CAP} means ` +
+      `"or more", so a delta check from a baseline of ${baseline} expecting ${expected} ` +
+      "more cannot be proved. Read the grouping off the Sessions screen instead.",
+  );
+}
 
 let text;
 try {
@@ -135,10 +200,37 @@ function retryAfter(response) {
   return Number.isNaN(when) ? interval : Math.max(0, (when - Date.now()) / 1000);
 }
 
+/** How many conversations Buildbox has grouped for this connection, or null
+ *  when it did not say. Null is not zero: an older Buildbox does not return the
+ *  field at all, and reading that as "no conversations" would send the caller
+ *  to a grouping problem that may not exist. */
+function conversationsSeen(answer) {
+  const count = answer?.conversations_seen;
+  return typeof count === "number" && Number.isFinite(count) ? count : null;
+}
+
 const deadline = Date.now() + wait * 1000;
 let body = null;
 
+/** Every ending goes through here, so the last answer is printed exactly once
+ *  and the reason for the exit code is always beside it. */
+function finish(code, message) {
+  if (body !== null) console.log(JSON.stringify(body));
+  if (message) console.error(message);
+  process.exit(code);
+}
+
+const overshot = (seen) =>
+  `conversations_seen reached ${seen}, past the ${target} this run expected ` +
+  `(baseline ${baseline} plus ${expected}): more conversations than turns you sent under one ` +
+  "conversation id, so the grouping is broken. Check troubleshooting rung 6.";
+
+// Set when the target is first reached: from then on the run is holding the
+// count still rather than waiting for it to rise.
+let settleUntil = null;
+
 for (;;) {
+  let note = "waiting";
   let response;
   try {
     response = await fetch(url, { headers: { Authorization: `Bearer ${connection.key}` } });
@@ -175,18 +267,52 @@ for (;;) {
     }
     body = parsed;
     if (Number(parsed?.spans_accepted ?? 0) > 0) {
-      console.error("arrived");
-      console.log(JSON.stringify(body));
-      process.exit(0);
+      if (target === null) finish(0, "arrived");
+      const seen = conversationsSeen(parsed);
+      if (seen === null) {
+        // Waiting cannot make an absent field appear, so this is the answer.
+        finish(
+          1,
+          "spans arrived, but this Buildbox did not report conversations_seen, so the " +
+            "conversation check could not run. Read the grouping off the Sessions screen instead.",
+        );
+      }
+      // Above the target, whenever it shows up, is the failure this check is
+      // for: the turns landed as separate conversations.
+      if (seen > target) finish(1, overshot(seen));
+      if (settleUntil === null && seen === target) {
+        if (settle <= 0) finish(0, `arrived, conversations_seen: ${seen}`);
+        settleUntil = Date.now() + settle * 1000;
+      } else if (settleUntil !== null && Date.now() >= settleUntil) {
+        finish(0, `arrived, conversations_seen: ${seen}`);
+      }
+      if (settleUntil !== null) {
+        // Always read at least once more inside the window, whatever --interval
+        // says: a settle window that never reads again would pass a split
+        // conversation exactly the way a floor did.
+        const left = Math.max((settleUntil - Date.now()) / 1000, 0.001);
+        console.error(`settling, conversations_seen: ${seen}`);
+        await sleep(Math.min(interval, left));
+        continue;
+      }
+      note = `waiting, conversations_seen: ${seen}`;
     }
   } else if (Date.now() + interval * 1000 > deadline) {
     fail(4, `Buildbox answered ${response.status} to the status read.`);
   }
 
-  console.error("waiting");
+  console.error(note);
   if (Date.now() + interval * 1000 > deadline) break;
   await sleep(interval);
 }
 
-if (body !== null) console.log(JSON.stringify(body));
-process.exit(1);
+if (target !== null && Number(body?.spans_accepted ?? 0) > 0) {
+  finish(
+    1,
+    `spans arrived but the conversations have not: conversations_seen is ` +
+      `${conversationsSeen(body)}, and this run was waiting for ${target} ` +
+      `(baseline ${baseline} plus ${expected}). Check conversation grouping, ` +
+      "troubleshooting rung 6.",
+  );
+}
+finish(1, null);

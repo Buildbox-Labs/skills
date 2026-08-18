@@ -47,13 +47,17 @@ node <skill dir>/scripts/detect.mjs --json
 Add `--dir <app path>` when the customer already named the app, and give the same kind of
 path to `--env-path` later: both are read relative to the directory you are in. The
 report carries the route and its evidence, plus `apps`, `entrypoints`, `restart`,
-`env_file`, and `env_file_safe`.
+`env_file`, `env_file_safe`, and a `note` when something it found needs qualifying.
 
 A field with one candidate is settled: take it and move on. Ask about the rest in one
 message, not four:
 
 1. **Which app**, when `apps` holds more than one candidate. In a monorepo this is the
-   app that talks to the model, not the repo root. Re-run with `--dir <app path>`.
+   app that talks to the model, not the repo root. The entrypoints usually settle it
+   without a question: when every file in `entrypoints` sits under one of the candidates,
+   that candidate is the app. Confirm it against that app's own manifest, re-run with
+   `--dir <app path>`, and carry on. Ask only when the entrypoints span two candidates or
+   the list is empty.
 
 2. **The AI entrypoint**, when `entrypoints` is empty or lists several files. The file
    and function where the model call actually happens. Confirm it against the code rather
@@ -64,6 +68,14 @@ message, not four:
    where environment variables actually come from.
 
 4. **The environment file**, when `env_file` does not match how the app actually runs.
+
+Trust `restart` and `env_file` only from a run that named the app, either `--dir <app>` or
+a single candidate. From a multi-app root the detector reports both as null with a note
+saying so, because the root's own `dev` script starts a different app and the root
+environment file is not the one the app reads. Those two nulls are the expected answer
+there, and the fix is the `--dir` re-run, not a question. Check `env_file.exists` too: a
+safety verdict about a file that is not there yet is a verdict about a path, and the file
+the app really loads may be elsewhere.
 
 Then make that file safe, before any key exists. `env_file_safe` reports where it stands:
 
@@ -152,7 +164,9 @@ Signals: the `ai` package in `package.json`, calls to `generateText`, `streamTex
 `generateObject`.
 
 Work: first read the installed `ai` major from the app's `package.json`, then use the
-matching recipe, then put the standard env block in place.
+matching recipe, then put the standard env block in place. The two majors carry the
+conversation and user ids by different mechanisms, and the wrong one does not typecheck,
+so the version is the first thing to establish, not the last.
 
 For `ai` major 6 or lower, turn on the SDK's built-in telemetry at every model call:
 
@@ -167,43 +181,78 @@ const result = await generateText({
 });
 ```
 
-The `metadata` keys land on the span as `ai.telemetry.metadata.userId` and
+On major 6 the `metadata` keys land on the span as `ai.telemetry.metadata.userId` and
 `ai.telemetry.metadata.sessionId`, and Buildbox reads exactly those two for user
-attribution and conversation grouping. For an AI SDK app this replaces the baggage
+attribution and conversation grouping. On the major-6 path this replaces the baggage
 setup in "Always, on every route": pass the app's own user id and its existing chat or
 thread id here on every call, and skip the baggage section. `userId` is replaced with a
 keyed hash before analysis, like `user.id`.
+
+`metadata` is a major-6-and-lower mechanism, under either option name. In major 7 both
+`experimental_telemetry` and `telemetry` are typed as the same `TelemetryOptions`, and it
+has no `metadata` field, so the snippet above does not typecheck on a major-7 install and
+breaks the build. Reading `ai.telemetry.metadata.userId` and
+`ai.telemetry.metadata.sessionId` is the major-6 path only. Major 7 is next.
 
 The AI SDK emits into whatever OTel setup is registered in the process, so the app still
 needs a tracer provider. On Next.js that is `instrumentation.ts` with
 `@vercel/otel`; on plain Node it is `@opentelemetry/sdk-node` started before the app
 code. If neither exists, add one, then come back to this step.
 
-For `ai` major 7, install `@ai-sdk/otel`, register its integration once at application
-startup alongside the tracer provider, and use the stable `telemetry` option for any
-per-call metadata:
+For `ai` major 7, install `@ai-sdk/otel` and register its integration once at application
+startup, alongside the tracer provider:
 
 ```ts
 import { OpenTelemetry } from "@ai-sdk/otel";
-import { generateText, registerTelemetry } from "ai";
+import { registerTelemetry } from "ai";
 
 registerTelemetry(new OpenTelemetry());
+```
+
+That one registration turns telemetry on for every AI SDK call in the process, and it
+stays. It does not carry the conversation or user id: `@ai-sdk/otel` emits no
+conversation, session, or user attribute of its own. Those ids come from a per-call
+telemetry integration with an `enrichSpan` closure, which is the major-7 replacement for
+`metadata`:
+
+```ts
+import { OpenTelemetry } from "@ai-sdk/otel";
+import { generateText } from "ai";
 
 const result = await generateText({
   model,
-  prompt,
+  messages,
   telemetry: {
-    functionId: "agent",
-    metadata: { userId: user.id, sessionId: chat.id },
+    functionId: "support-chat",
+    integrations: new OpenTelemetry({
+      enrichSpan: () => ({
+        "gen_ai.conversation.id": conversationId,
+        "user.id": userId,
+      }),
+    }),
   },
 });
 ```
 
-Registration enables telemetry for all AI SDK calls by default in major 7. The
-`telemetry` option is only needed for metadata or to opt a call out. Set the same
-`userId` and `sessionId` metadata keys as on the major-6 path, and for the same reason:
-Buildbox reads them for user attribution and conversation grouping, so an AI SDK app
-does not need the baggage setup.
+Both attributes land on every `gen_ai` span the call produces, which is the pair Buildbox
+reads for conversation grouping and user attribution. `functionId` still belongs in the
+recipe: it lands as `gen_ai.agent.name`. The per-call integration takes precedence for
+that call, and the global registration above goes on covering every other AI SDK call in
+the app.
+
+Two shapes that look like they should work and do not. A global `enrichSpan`, registered
+once at startup, cannot see per-request ids: what it is handed describes the call, not
+your request, so the closure has to be built where the ids are. And the runtime-context
+option, `generateText({ context: {...} })`, names its attributes
+`ai.settings.context.<key>`, which Buildbox does not read.
+
+On major 7 the `enrichSpan` closure is what carries the ids, so a major-7 AI SDK app that
+skips it has no conversation grouping at all. Either set it on every call, or do the
+baggage setup in "Always, on every route" instead. Do not skip both.
+
+`next dev` runs Turbopack, which does not typecheck. After editing the entrypoint, run
+`next build` or `tsc --noEmit` before you call the edit done: a wrong telemetry option
+compiles fine under the dev server and fails in the customer's CI.
 
 ### A running provider, first
 
@@ -225,6 +274,19 @@ provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
 trace.set_tracer_provider(provider)
 ```
 
+Install into the environment the app actually runs in, `.venv/bin/pip install ...`, or
+`uv add` or `poetry add` where the project uses them. Then add the same packages to
+`requirements.txt` or the `pyproject.toml` dependency list. This is the Python asymmetry:
+`npm install` records the dependency in `package.json` for free, `pip install` records
+nothing, and the app now imports OpenTelemetry at startup. A manifest left untouched
+means the next deploy builds an app that cannot boot at all, which is worse than the
+silent no-traces failures the rest of this skill is about.
+
+Build the provider after `load_dotenv()` when the app uses `python-dotenv`. The OTLP
+exporter reads the endpoint and the headers out of `os.environ` when it is constructed,
+so a provider set up in a module that is imported before `load_dotenv()` runs posts to
+`localhost:4318` and nothing ever reaches Buildbox, with no error to go on.
+
 If the Python app is launched through a CLI, `opentelemetry-instrument` can auto-init
 the provider and exporter instead of this code setup.
 
@@ -240,6 +302,58 @@ const sdk = new NodeSDK({ traceExporter: new OTLPTraceExporter() });
 sdk.start();
 await import("./app.js");
 ```
+
+That shape makes the tracer file the entrypoint. When the app has an entrypoint worth
+keeping, put the same `new NodeSDK(...).start()` in its own file with no trailing import,
+and load it ahead of the app instead:
+
+```bash
+node --import ./tracing.mjs server.mjs
+```
+
+Change the app's dev and start scripts to that form, so a restart cannot come up without
+the tracer. It is also the only form that works when something else has to own the
+entrypoint.
+
+Where the app needs the conversation id copied off baggage, the span processor that does
+it goes in the same setup. `NodeSDK` uses `spanProcessors` if it is there and ignores
+`traceExporter` entirely, so the exporter has to move into the array as well:
+
+```ts
+import { propagation } from "@opentelemetry/api";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
+
+const COPY = ["gen_ai.conversation.id", "user.id"];
+
+const fromBaggage = {
+  onStart(span, parentContext) {
+    const carried = propagation.getBaggage(parentContext);
+    for (const key of COPY) {
+      const value = carried?.getEntry(key)?.value;
+      if (value) span.setAttribute(key, value);
+    }
+  },
+  onEnd() {},
+  async forceFlush() {},
+  async shutdown() {},
+};
+
+const sdk = new NodeSDK({
+  spanProcessors: [fromBaggage, new BatchSpanProcessor(new OTLPTraceExporter())],
+});
+sdk.start();
+```
+
+That needs `@opentelemetry/sdk-trace-base` alongside the two packages above. Read the
+baggage off the context `onStart` is handed, not off the active one. The processor is
+listed before the exporter's so the attribute is set before the span is queued, and all
+four methods have to exist even when three of them do nothing. Use `spanProcessors`, not
+the deprecated `spanProcessor`. Keep the import on `@opentelemetry/sdk-trace-base`, which
+takes the exporter positionally: the same class name in `@opentelemetry/sdk-trace` takes
+`{ exporter }` instead, and the positional form there fails at shutdown rather than at
+construction.
 
 ### Route 3: LangChain or LangGraph
 
@@ -261,6 +375,25 @@ LangChainInstrumentor().instrument()
 Node, OpenInference: register the LangChain instrumentation with your
 `NodeSDK` instrumentations list.
 
+A Node app that imports `@langchain/core` as an ES module needs one more line, the same
+trap route 4 spells out. The instrumentations list patches `require` calls only, so an
+ESM import is never touched and the tracer runs and emits nothing: measured on a chain
+with one step, the instrumentations list alone produced zero spans and the line below
+produced the span. Hand the callback manager **module** to the instrumentation:
+
+```ts
+import { LangChainInstrumentation } from "@arizeai/openinference-instrumentation-langchain";
+import * as CallbackManagerModule from "@langchain/core/callbacks/manager";
+
+const instrumentation = new LangChainInstrumentation();
+instrumentation.manuallyInstrument(CallbackManagerModule);
+```
+
+The whole module, not a class: LangChain routes every chain, graph, and model call
+through its callback manager, so that is the thing to patch. A CommonJS LangChain app may
+well be covered by the instrumentations list alone, so this is the ESM case, not a
+replacement for the list.
+
 This goes in the process entrypoint, before the first chain or graph is built.
 
 ### Route 4: bare OpenAI, OpenAI Agents, Anthropic, or another client SDK
@@ -275,6 +408,23 @@ or Anthropic, registered once at startup. OpenAI Agents uses the matching instru
 `openinference-instrumentation-openai-agents`.
 
 If the app uses two clients, register both instrumentors.
+
+Node apps that import the client as an ES module need one more line. The
+instrumentations list on `NodeSDK` patches `require` calls only, so an `import Anthropic
+from "@anthropic-ai/sdk"` (or `import OpenAI from "openai"`) is never touched, the tracer
+runs, and no model-call span is ever emitted: a setup that looks connected and reports
+nothing. Register the instrumentation and then hand it the imported class explicitly:
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+import { AnthropicInstrumentation } from "@arizeai/openinference-instrumentation-anthropic";
+
+const instrumentation = new AnthropicInstrumentation();
+instrumentation.manuallyInstrument(Anthropic);
+```
+
+Same shape for the OpenAI instrumentation and the `OpenAI` class. Confirm the method
+name against the installed package's README when it moves.
 
 ### Route 5: nothing recognizable
 
@@ -441,15 +591,33 @@ finally:
     context.detach(token)
 ```
 
+The same thing in Node:
+
+```ts
+import { context, propagation } from "@opentelemetry/api";
+
+const carried = propagation.setBaggage(
+  context.active(),
+  propagation.createBaggage({ "gen_ai.conversation.id": { value: conversationId } }),
+);
+await context.with(carried, async () => {
+  // every span created in here carries the id
+});
+```
+
 Then copy the baggage value onto spans as an attribute, either with a span processor that
 reads baggage on start, or by setting `gen_ai.conversation.id` explicitly on the spans you
-create. Use the id your app already has for a thread or a chat, not a new one.
+create. The Node span processor is in "A running provider, first". Use the id your app
+already has for a thread or a chat, not a new one.
 
-Single-shot agents with no follow-up turns can skip this. Vercel AI SDK apps can skip it
-too: the `metadata: { userId, sessionId }` telemetry option in route 2 carries both ids
-without any baggage code.
+Single-shot agents with no follow-up turns can skip this. So can a Vercel AI SDK app that
+already carries the ids through its route 2 recipe: the per-call `enrichSpan` on major 7,
+the `metadata` keys on major 6. An AI SDK app that does neither still needs this section.
 
-**Suggest a user id.** If the app knows who is talking, set `user.id` on the same spans.
+**Suggest a user id.** If the app already knows who is talking, set `user.id` on the same
+spans from that existing value. If it does not, propose the change in one sentence and
+leave it to the customer: do not add a field to a request body, a header, or a session
+shape to make an id exist. Setup is not the place to change the app's contract.
 Buildbox replaces it with a keyed hash before analysis. On a `full` connection, the raw
 batch, like all trace content, first sits in a bounded, short-lived quarantine store for
 no more than seven days; `metadata_only` hashes the id on arrival. The hashed id is what
@@ -463,31 +631,78 @@ it off. A custom key nobody reads is noise in the customer's trace bill.
 
 Not when the code compiles. Not when a test span goes through. Done is:
 
-1. **Restart the app yourself** when the restart command is a local one. Run it, then
-   confirm the process really restarted; a hot reloader often does not re-read the app's
-   environment file. When the app only runs somewhere you cannot reach, ask the customer
-   to restart it.
-2. **Perform one real interaction yourself**, through the app's real entrypoint: an HTTP
-   call to the chat route, or a browser tool against the local UI. Against a local or
-   staging instance only, never production. If you can reach neither, ask the customer to
-   do it: an actual chat, an actual agent run, the thing the app is for. A request through
-   the app's real code path is the interaction; a hand-made span is not.
-3. **Wait for the span to land.**
+1. **Typecheck or build what you edited**, when the project has a command for it:
+   `tsc --noEmit`, `next build`, or `python -c "import app"` in the project's own
+   environment. Every route in this skill edits application source, and a dev server is
+   not a typechecker. Do this before the restart, so a broken edit shows up here and not
+   in the customer's CI.
+2. **Restart the app yourself** when the restart command is a local one. First find out
+   what is already running, with `pgrep -f <the command>` or by checking the port. Stop
+   only a process you started, or the app's own process on its port, and never a bare
+   pattern kill: on a machine where the customer already had the app up, that takes down
+   something you did not put there. Then run the restart and confirm the process really
+   restarted; a hot reloader often does not re-read the app's environment file. When the
+   app only runs somewhere you cannot reach, ask the customer to restart it. Leave the app
+   in the state you found it or running, and say in your summary which one.
+3. **Read the conversation baseline, then perform one real interaction yourself, two
+   turns under one conversation id.** The baseline first, because the check in step 4 is
+   a delta and the number has to come from before the turns:
 
    ```bash
-   node <skill dir>/scripts/status.mjs --env-path <app environment file> --wait 90
+   node <skill dir>/scripts/status.mjs --env-path <app environment file> --wait 0
    ```
+
+   That reads once and stops. Expect exit 1, and `conversations_seen` 0, on a connection
+   that has never received anything. Keep the `conversations_seen` number it prints.
+
+   Then the interaction, through the app's real entrypoint: an HTTP call to the chat
+   route, or a browser tool against the local UI. Against a local or staging instance
+   only, never production. Two turns, not one, and both carrying the same conversation
+   id: one turn cannot show whether the grouping works, and grouping is the thing the
+   analysis is built on. If you can reach the app at all, do this yourself. If you can
+   reach neither, ask the customer to do it: an actual chat, an actual agent run, the
+   thing the app is for. A request through the app's real code path is the interaction; a
+   hand-made span is not.
+4. **Wait for the conversation to land**, not just a span. After the two turns:
+
+   ```bash
+   node <skill dir>/scripts/status.mjs --env-path <app environment file> \
+     --wait 90 --baseline <the number from step 3> --new-conversations 1
+   ```
+
+   `--baseline <n>` is that reading from before the interaction, and `--new-conversations
+   <k>` is one per conversation id you sent, so two turns under one id is
+   `--new-conversations 1`. The check waits for `conversations_seen` to reach n + k, and
+   then keeps reading for a settle window, `--settle` seconds, 20 by default, to see
+   whether it stops there. An overshoot, a count past n + k on the first read or any read
+   inside that window, means more conversations arrived than turns you sent, so the turns
+   were split instead of grouped, and that exits 1 rather than passing. Allow up to the
+   wait plus the settle window for the answer. A plain floor like "at least one
+   conversation" would pass both failures on a connection that already had conversations,
+   which is why the check is a delta.
 
    It reads the endpoint and the key out of the environment file, asks Buildbox, and
    prints the answer:
-   `{"first_trace_at": "2026-08-17T14:02:11+00:00", "spans_accepted": 128}`, or
-   `{"first_trace_at": null, "spans_accepted": 0}` when nothing has arrived yet. The
-   answer carries no secret. Exit 0 means spans arrived. Exit 1 means still nothing after
-   the wait, so go to troubleshooting. Exit 5 means the key in the file is not the live
-   one, which is rung 3.
-4. **The setup screen is the customer's signal.** Once the status read is green, point
+   `{"first_trace_at": "2026-08-17T14:02:11+00:00", "spans_accepted": 128,
+   "conversations_seen": 1}`, or
+   `{"first_trace_at": null, "spans_accepted": 0, "conversations_seen": 0}` when nothing
+   has arrived yet. The answer carries no secret. Exit 0 means spans arrived and the delta
+   was met and held. Exit 1 means still nothing after the wait, or the delta never
+   arrived, or the count overshot it, and its message says which: all three conversation
+   cases are rung 6, not a missing exporter. Exit 2 when the baseline plus the expected
+   conversations reaches the count's 1000 cap means there is no exact number to measure a
+   delta against, so read the grouping off the Sessions screen instead. Exit 5 means the
+   key in the file is not the live one, which is rung 3.
+
+   Spans arriving is not the same as the setup working. On Next.js, `@vercel/otel`'s HTTP
+   spans count towards `spans_accepted`, so that number can go green on an app with no
+   model telemetry at all. The conversation count is the number that answers the question.
+   An older Buildbox does not return `conversations_seen`; the script says so plainly
+   rather than reading the absence as zero, and then the Sessions screen in step 6 is the
+   check.
+5. **The setup screen is the customer's signal.** Once the status read is green, point
    them at it: it flips from "Waiting for your first trace" to showing traces arriving.
-5. For a `full` connection, both checks above only confirm trace arrival. After a few
+6. For a `full` connection, both checks above only confirm trace arrival. After a few
    minutes, have the customer open Sessions from Home and check that the real interaction
    appears with turns before treating message capture as verified.
 
@@ -543,6 +758,14 @@ below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 
    exporter's own logging, read the URL it posts to, and remove or repoint the general
    variable so only the per-signal one decides where traces go.
 
+2b. **A withheld `protobufjs` postinstall, but only if nothing is arriving.** On Node, the
+   HTTP/protobuf exporter depends on `protobufjs`, and some npm configurations withhold its
+   postinstall script (`npm warn allow-scripts: protobufjs ... not yet covered by
+   allowScripts` at install time). On a modern npm that postinstall only prints a version
+   note, so the warning on its own is usually benign and traces flow with it present. If
+   you saw the warning and nothing is arriving, allow the script, reinstall, and read the
+   exporter's own logging. Do not chase it while spans are arriving.
+
 3. **401 from the endpoint.** The key is wrong, truncated, or has been rotated since it
    was pasted. On the standard path, have the customer check
    `OTEL_EXPORTER_OTLP_TRACES_HEADERS` themselves for `%20`. On the multi-backend path,
@@ -566,9 +789,15 @@ below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 
    reading from a different env source are all common. Restart, and set the variables
    where that environment actually reads them from.
 
-6. **Spans exist but no conversations.** Traces arrive and every conversation is one turn
-   long: the conversation id is not propagating. Go back to the baggage section, or for
-   an AI SDK app, the `metadata` option in route 2.
+6. **Spans exist but the conversations do not.** `status.mjs --baseline` exits 1 with
+   spans accepted, either because the delta never arrived or because the count overshot
+   it, or traces arrive and every conversation is one turn long: the conversation id is
+   not propagating. An overshoot is that same failure caught earlier, one conversation per
+   turn instead of one per id. Go back to the baggage section, or for an AI SDK app, to
+   the route 2 recipe for the installed major, the per-call `enrichSpan` on major 7 and
+   the `metadata` option on major 6. On Next.js, check that the spans are model-call spans
+   at all and not just `@vercel/otel`'s HTTP spans, which is the same failure one step
+   earlier.
 
 7. **Conversations arrive without message text on a `full` connection.** The instrumentor
    is not capturing content, which is a producer setting, not a Buildbox one. The official
@@ -611,8 +840,20 @@ node <skill dir>/scripts/detect.mjs --dir ./apps/agent --json
 ```
 
 `--json` prints `{route, framework, evidence, app, apps, entrypoints, restart, env_file,
-env_file_safe}`. It reads files only: no network, no writes. It is a starting point, not
-a verdict. Confirm the route against the entrypoint before you edit anything.
+env_file_safe, note}`. It reads files only: no network, no writes. It is a starting point,
+not a verdict. Confirm the route against the entrypoint before you edit anything.
+
+Three fields need reading carefully. `restart` and `env_file` come back null, with `note`
+saying to re-run with `--dir <app>`, whenever there is more than one app candidate and no
+`--dir`: at a monorepo root the answers would describe the wrong app. `env_file.exists`
+is false when the file the app would read is not there yet, and `env_file_safe` still
+answers for that path, because the ignore rule has to be in place before the key is
+written. A Python `restart` may carry `source: "inferred from FastAPI entrypoint"`, which
+is worked out from the code rather than read from a manifest, so confirm it before you run
+it; under a `src/` layout it also carries a `note`, because an installed package is
+usually imported without the `src.` prefix and then uvicorn needs `--app-dir src`. When
+the path cannot be a Python module at all, a hyphen in a directory name for instance,
+nothing is inferred and `restart` stays null.
 
 **`pair.mjs`** redeems a pairing code and writes the environment lines it gets back.
 
@@ -636,17 +877,33 @@ be https, or http on localhost for a developer's own machine.
 environment file.
 
 ```bash
-node <skill dir>/scripts/status.mjs --env-path <file> --wait 90
+node <skill dir>/scripts/status.mjs --env-path <file> --wait 0
+node <skill dir>/scripts/status.mjs --env-path <file> --wait 90 --baseline 3 \
+  --new-conversations 1
 ```
 
 It reads either variable form, the three standard `OTEL_` lines or the two dedicated
 `BUILDBOX_` ones, and it holds the endpoint to the same https rule. Exit 0 means spans
-have arrived, 1 means none yet, 5 means the key was rejected, 4 means Buildbox could not
-be reached or would not answer within the wait (a rate limit longer than `--wait` is
-reported this way, with the seconds to hold off; it says nothing about whether spans
-arrived), 2 means the file had no Buildbox variables or an endpoint the script will not
-call. Add `--wait 0` for a single read, `--interval <seconds>` to poll at a different
-pace.
+have arrived, and the conversation delta was met and held when one was asked for. Exit 1
+means none yet, or the delta was not met, or more conversations arrived than turns were
+sent. Exit 5 means the key was rejected, 4 means Buildbox could not be reached or would
+not answer within the wait (a rate limit longer than `--wait` is reported this way, with
+the seconds to hold off; it says nothing about whether spans arrived), 2 means the file
+had no Buildbox variables or an endpoint the script will not call. Add `--wait 0` for a
+single read, `--interval <seconds>` to poll at a different pace.
+
+`--baseline <n>` turns the read into a delta check around one interaction: n is the
+`conversations_seen` value read before the interaction, and the run waits for the count to
+reach n plus `--new-conversations <k>`, one by default and one per conversation id sent.
+Then it holds for `--settle <seconds>`, 20 by default, and a count that climbs past n + k
+in that window exits 1, because more conversations than turns means the turns were split
+rather than grouped. A floor would pass both failures on a connection that already had
+conversations, and `spans_accepted` alone goes green on a Next.js app whose only spans are
+HTTP spans. An older Buildbox does not return `conversations_seen` at all, and the script
+says so and exits 1 rather than reading the absence as zero, because zero would send you
+to a grouping problem that may not exist. The count is exact below 1000 and 1000 means
+"1000 or more", so a baseline plus expected conversations that reaches 1000 exits 2
+instead of running a check it could not prove.
 
 The path flag is `--env-path`, not `--env-file`, in both scripts: node reads an
 `--env-file` argument itself wherever it appears on the command line, and quits before the

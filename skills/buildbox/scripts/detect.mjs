@@ -14,7 +14,7 @@
 // the caller can tell "nothing found" from "found nothing to worry about".
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 
 const USAGE = "usage: node detect.mjs [--dir <path>] [--json]";
 
@@ -364,17 +364,86 @@ function firstScript(text, section) {
   return null;
 }
 
+const UVICORN_FILES = [
+  "pyproject.toml",
+  "Dockerfile",
+  "Procfile",
+  "docker-compose.yml",
+  "compose.yml",
+  "README.md",
+  "readme.md",
+  "README.rst",
+];
+
+/** A written-down `uvicorn <module>:<app>` line, wherever the project keeps it.
+ *  The README counts: the requirements.txt-plus-README layout is the most
+ *  common FastAPI shape and it declares the run command nowhere else. The
+ *  module:app shape is required so a dependency pin like `uvicorn[standard]`
+ *  or a prose mention of the package is not read back as a command. */
 function uvicornMention(path) {
-  for (const name of ["pyproject.toml", "Dockerfile", "Procfile", "docker-compose.yml", "compose.yml"]) {
+  for (const name of UVICORN_FILES) {
     const text = readText(join(path, name));
     if (!text) continue;
-    const match = text.match(/uvicorn[^\n"'\]]*/);
+    const match = text.match(/uvicorn\s+[A-Za-z0-9_.]+:[A-Za-z0-9_]+[^\n"'`\]]*/);
     if (match) return { command: match[0].trim(), source: `${name} (uvicorn)` };
   }
   return null;
 }
 
-function detectRestart(path) {
+const PYTHON_KEYWORDS = new Set([
+  "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+  "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+  "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
+  "try", "while", "with", "yield",
+]);
+
+/** The dotted module uvicorn would import for a file, or null when the path
+ *  cannot be one. A package entrypoint is its package, so `api/__init__.py` is
+ *  `api` and not `api.__init__`. A directory Python cannot name, a hyphen, a
+ *  leading digit, a keyword, means there is no module here to guess a run
+ *  command from, and a wrong command is worse than none. */
+function pythonModule(root, file) {
+  const path = relative(root, file);
+  if (!path || path.startsWith("..")) return null;
+  const segments = path.replace(/\.py$/, "").split(sep);
+  if (segments.at(-1) === "__init__") segments.pop();
+  if (segments.length === 0) return null;
+  const nameable = (segment) =>
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(segment) && !PYTHON_KEYWORDS.has(segment);
+  if (!segments.every(nameable)) return null;
+  return { module: segments.join("."), src: segments.length > 1 && segments[0] === "src" };
+}
+
+/** The same command worked out from the code when nothing wrote it down: a
+ *  detected FastAPI entrypoint gives the module and the app variable, and
+ *  `uvicorn.run(..., port=N)` in the same file gives the port. Inferred, so it
+ *  says so, and every explicit source above wins over it. */
+function inferUvicorn(path, entrypoints) {
+  for (const file of entrypoints) {
+    if (!file.endsWith(".py")) continue;
+    const text = readText(file);
+    if (!text) continue;
+    const variable = text.match(/^[ \t]*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*FastAPI\s*\(/m);
+    if (!variable) continue;
+    const named = pythonModule(path, file);
+    if (!named) continue;
+    const port = text.match(/\bport\s*=\s*(\d{2,5})\b/);
+    // A src layout usually installs the package as `api`, not `src.api`, and
+    // then uvicorn needs to be pointed at the directory instead.
+    const note = named.src
+      ? "src layout, so this may need --app-dir src with the module as " +
+        `${named.module.replace(/^src\./, "")}:${variable[1]} instead. Confirm it before running it.`
+      : null;
+    return {
+      command: `uvicorn ${named.module}:${variable[1]}${port ? ` --port ${port[1]}` : ""}`,
+      source: "inferred from FastAPI entrypoint",
+      ...(note ? { note } : {}),
+    };
+  }
+  return null;
+}
+
+function detectRestart(path, entrypoints = []) {
   const pkg = readJson(join(path, NODE_MANIFEST));
   const scripts = pkg?.scripts ?? {};
   for (const name of ["dev", "start"]) {
@@ -423,7 +492,7 @@ function detectRestart(path) {
     }
   }
 
-  return uvicornMention(path);
+  return uvicornMention(path) ?? inferUvicorn(path, entrypoints);
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +545,17 @@ function detectEnvFile(path) {
   return { path: join(path, ".env"), reason: "dotenv default" };
 }
 
+/** Say whether the file that was worked out is actually there. A safety verdict
+ *  about a file that does not exist reads as an all-clear, and the file the app
+ *  really loads may be somewhere else entirely. The git checks still run: they
+ *  answer for the path, not for the bytes, and the pattern has to be in place
+ *  before the key is written. */
+function describeEnvFile(found) {
+  if (!found) return null;
+  if (exists(found.path)) return { ...found, exists: true };
+  return { ...found, exists: false, note: "file does not exist yet" };
+}
+
 /** Is that environment file ignored by git, and is it already tracked? Tracked
  *  is the dangerous one: an ignore rule does not untrack a file that is already
  *  committed. `checked: false` means git could not answer, not that the file is
@@ -511,13 +591,24 @@ const safely = (compute, fallback) => {
 };
 
 const entrypoints = safely(() => findEntrypoints(appDir), []);
-const restart = safely(() => detectRestart(appDir), null);
-const envFile = safely(() => detectEnvFile(appDir), null);
+
+// Several candidates and no --dir means the working directory is not the app.
+// Its scripts start something else and its environment file is not the one the
+// app reads, so answering either would be a confident wrong answer: the
+// monorepo case where a root `pnpm dev` starts the marketing site and a root
+// `.env` that does not exist gets a clean safety verdict. Both degrade to null
+// and the note says how to get the real ones.
+const unresolved = !dir && apps.length > 1;
+const restart = unresolved ? null : safely(() => detectRestart(appDir, entrypoints), null);
+const envFile = unresolved ? null : safely(() => describeEnvFile(detectEnvFile(appDir)), null);
 const envFileSafe = safely(() => checkEnvFileSafety(appDir, envFile?.path), {
   ignored: null,
   tracked: null,
   checked: false,
 });
+const note = unresolved
+  ? `${apps.length} app candidates and no --dir, so restart and env_file are not reported. Re-run with --dir <app>.`
+  : null;
 
 const nothingRead = seen.length === 0;
 const result = {
@@ -530,6 +621,7 @@ const result = {
   restart,
   env_file: envFile,
   env_file_safe: envFileSafe,
+  note,
 };
 
 if (nothingRead) {
@@ -569,14 +661,17 @@ if (json) {
   }
   console.log(`entrypoints: ${entrypoints.length > 0 ? entrypoints.join(", ") : "none found"}`);
   console.log(`restart: ${restart ? `${restart.command} (${restart.source})` : "unknown"}`);
+  if (restart?.note) console.log(`  ${restart.note}`);
   if (envFile) {
     const safety = !envFileSafe.checked
       ? "git did not answer, check by hand"
       : `${envFileSafe.ignored ? "ignored" : "NOT ignored"}, ${envFileSafe.tracked ? "TRACKED, untrack it" : "untracked"}`;
-    console.log(`env file: ${envFile.path} (${envFile.reason}), ${safety}`);
+    const there = envFile.exists ? "" : ", does not exist yet";
+    console.log(`env file: ${envFile.path} (${envFile.reason})${there}, ${safety}`);
   } else {
     console.log("env file: unknown");
   }
+  if (note) console.log(note);
 
   if (!nothingRead) {
     console.log("\nA manifest entry is not proof spans are emitted. Confirm at the entrypoint.");
