@@ -90,6 +90,10 @@ Then make that file safe, before any key exists. `env_file_safe` reports where i
 Verify that the file is ignored and untracked before continuing to step 2. Do not ask the
 customer to open the Buildbox setup screen yet; with a pairing code they never have to.
 
+If this skill was installed with `npx skills add`, that install wrote `.claude/skills/`
+and `skills-lock.json` into the customer's repo, so add both to `.gitignore`, or have the
+customer commit them deliberately, before a later `git add -A` vendors them by accident.
+
 ## Step 2: pick the route
 
 Step 1 reported the route. Read the code to confirm it before you change anything.
@@ -651,7 +655,9 @@ Not when the code compiles. Not when a test span goes through. Done is:
    customer to restart it. Leave the app in the state you found it or running, and say in
    your summary which one. If you started it as a background task in a headless session,
    say that too, and give the customer the one command that brings it up in their own
-   terminal.
+   terminal. If you redirect the app's output to a log file, put that file inside the
+   app directory, ignored by git, or give it a unique name; never a fixed `/tmp` path
+   another run may already be using.
 3. **Read the conversation baseline, then perform one real interaction yourself, two
    turns under one conversation id.** The baseline first, because the check in step 4 is
    a delta and the number has to come from before the turns:
@@ -668,8 +674,10 @@ Not when the code compiles. Not when a test span goes through. Done is:
    before or after them: if you drive the UI with a browser tool, close the tab once the two
    turns are done. An app with HTTP auto-instrumentation traces every request, so anything
    beyond the turns themselves is a model-free trace. Buildbox no longer counts a trace with
-   no turns in it as a conversation, but a customer on an older Buildbox still does, and
-   either way a quiet app is what makes the settle window in step 4 mean anything.
+   no turns and no error in it as a conversation, but one that failed still counts (a 500 on
+   a health probe is a real failure, not browsing), and a customer on an older Buildbox
+   counts every model-free trace, so a quiet app is what makes the settle window in step 4
+   mean anything.
 
    Then the interaction, through the app's real entrypoint: an HTTP call to the chat
    route, or a browser tool against the local UI. Against a local or staging instance
@@ -735,6 +743,20 @@ Not when the code compiles. Not when a test span goes through. Done is:
 6. For a `full` connection, both checks above only confirm trace arrival. After a few
    minutes, have the customer open Sessions from Home and check that the real interaction
    appears with turns before treating message capture as verified.
+7. **Close with a short summary**, and put these in it:
+   - The step 4 check, verbatim: the command, its exit code, and the settled
+     `conversations_seen` against the expected target.
+   - Which state you left the app in, running or stopped, plus the one command that brings
+     it up in the customer's own terminal when you started it as a background task.
+   - What the customer does next: the setup screen from step 5, and on a `full` connection
+     the Sessions check from step 6.
+   - Which environment variables have to be set again in the deployment platform's secret
+     store, by name, never by value.
+
+   Step 4 has to exit 0 for the setup to be done. Exit 2 at the count's 1000 cap is the one
+   documented alternative, and then the summary carries what the Sessions screen showed
+   instead. A step 4 still non-zero after the retry is not done: say which command, which
+   exit code, and what it printed, plainly, instead of narrating around it.
 
 The deploy stays with the customer, and so does the decision to make it. Say which
 variables go where: the ones now in the local environment file have to be set again in the
