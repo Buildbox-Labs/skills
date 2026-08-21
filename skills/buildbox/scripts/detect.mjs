@@ -190,7 +190,87 @@ function hits(declared, patterns) {
 
 // Ordered lightest route first: the first rung that matches wins, because the
 // ladder's whole point is to add as little as possible.
+//
+// The named frameworks come before the generic rungs, and that ordering is the
+// deliberate part. A framework that speaks OpenTelemetry itself (Pydantic AI,
+// Mastra, Spectrum-TS) or has a published instrumentor of its own (Agno,
+// CrewAI, DSPy) has a recipe that is strictly more specific than "an
+// OpenTelemetry package is declared here", and in most of these apps that
+// package is the framework's own dependency rather than an exporter the
+// customer set up: CrewAI pins the OTel SDK, Pydantic AI requires the API,
+// Mastra and Spectrum-TS both ship exporters built on it. Going the other way,
+// a real existing exporter is never hidden by this, because every matching rung
+// still contributes its evidence line: a Mastra verdict arrives with the
+// "existing OpenTelemetry" evidence beside it, and the skill's route 1 text
+// says to keep that backend and add Buildbox next to it. LangChain stays below
+// the generic rung, where it already was, because route 1's own text is written
+// around that case.
+//
+// `hint` is the one-line next step for the text output; a rung without one
+// falls back to the note for its route number.
 const RUNGS = [
+  {
+    route: 1,
+    framework: "Pydantic AI",
+    node: [],
+    // `pydantic-ai` is the meta-package and depends on `pydantic-ai-slim`.
+    python: ["pydantic-ai", "pydantic-ai-slim"],
+    hint:
+      "Pydantic AI emits OpenTelemetry itself. Add a provider if none runs, call " +
+      "Agent.instrument_all(), then use the applicable exporter path. Check that runs are passed a " +
+      "conversation_id.",
+  },
+  {
+    route: 1,
+    framework: "Mastra",
+    // `@mastra/core` is the library; the bare `mastra` package is the CLI.
+    node: ["@mastra/", "mastra"],
+    verdictNode: ["@mastra/core"],
+    python: [],
+    hint:
+      "Mastra exports through @mastra/otel-exporter in its own observability config. Endpoint " +
+      "and header are set in code, so use the dedicated BUILDBOX_OTLP_TRACES_* pair.",
+  },
+  {
+    route: 1,
+    framework: "Spectrum-TS",
+    // Adobe's @react-spectrum/* and @spectrum-icons/* are a UI library, not this.
+    node: ["spectrum-ts", "@spectrum-ts/"],
+    python: [],
+    hint:
+      "Keep Spectrum's scoped vendor telemetry, start an app-global NodeSDK with the dedicated " +
+      "Buildbox exporter, and instrument the actual model client.",
+  },
+  {
+    route: 3,
+    framework: "Agno",
+    node: [],
+    python: ["agno"],
+    hint:
+      "Register AgnoInstrumentor at startup, then use the applicable exporter path. " +
+      "setup_tracing() writes to a database, it is not an OTLP route.",
+  },
+  {
+    route: 3,
+    framework: "CrewAI",
+    node: [],
+    // `crewai-core` and `crewai-cli` share the pin; `crewai-tools` is separate.
+    python: ["crewai", "crewai-"],
+    verdictPython: ["crewai"],
+    hint:
+      "Register CrewAIInstrumentor and the active LLM client's instrumentor at startup, then " +
+      "add the applicable exporter path. Let OTel resolve inside CrewAI's ~=1.42 pin.",
+  },
+  {
+    route: 3,
+    framework: "DSPy",
+    node: [],
+    // `dspy-ai` is a compatibility alias for `dspy` at the same version.
+    python: ["dspy", "dspy-ai"],
+    hint:
+      "Register DSPyInstrumentor at startup, then use the applicable exporter path. Optimizer " +
+      "runs trace every candidate against every example, so start with the serving path.",
+  },
   {
     route: 1,
     framework: "existing OpenTelemetry",
@@ -238,7 +318,11 @@ for (const rung of RUNGS) {
   const found = [...hits(nodeDeps, rung.node), ...hits(pyDeps, rung.python)];
   if (found.length === 0) continue;
   for (const name of new Set(found)) evidence.push(`${rung.framework}: ${name}`);
-  if (!verdict) verdict = rung;
+  const verdictFound = [
+    ...hits(nodeDeps, rung.verdictNode ?? rung.node),
+    ...hits(pyDeps, rung.verdictPython ?? rung.python),
+  ];
+  if (!verdict && verdictFound.length > 0) verdict = rung;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +330,10 @@ for (const rung of RUNGS) {
 // ---------------------------------------------------------------------------
 
 const CODE_EXTENSIONS = [".ts", ".tsx", ".js", ".mjs", ".py"];
-const MODEL_MODULES = [
+// Manifest evidence intentionally accepts companion packages, but an entrypoint
+// must import the runtime itself. Otherwise exporter and config files become the
+// suggested place to add instrumentation.
+const ENTRYPOINT_MODEL_MODULES = [
   "ai",
   "openai",
   "@anthropic-ai/sdk",
@@ -256,9 +343,25 @@ const MODEL_MODULES = [
   "langgraph",
   "@openai/agents",
   "openai-agents",
+  "@mastra/core",
+  "spectrum-ts",
+  "@spectrum-ts/core",
 ];
 // Python imports the distributions above under these top-level module names.
-const PYTHON_MODEL_MODULES = ["openai", "anthropic", "langchain", "langgraph", "agents"];
+// `pydantic_ai` is listed whole: plain `pydantic` is a validation library that
+// half the ecosystem imports and it says nothing about model calls.
+const PYTHON_ENTRYPOINT_MODEL_MODULES = [
+  "openai",
+  "anthropic",
+  "langchain",
+  "langgraph",
+  "agents",
+  "agno",
+  "crewai",
+  "dspy",
+  "pydantic_ai",
+];
+const WHOLE_PYTHON_ENTRYPOINT_MODULES = new Set(["agno", "crewai", "dspy", "pydantic_ai"]);
 
 const IMPORT_PATTERNS = [
   /\bfrom\s*["']([^"']+)["']/g,
@@ -271,7 +374,7 @@ function importsModel(text) {
   for (const pattern of IMPORT_PATTERNS) {
     for (const match of text.matchAll(pattern)) {
       const specifier = match[1];
-      const hit = MODEL_MODULES.some((name) =>
+      const hit = ENTRYPOINT_MODEL_MODULES.some((name) =>
         name.endsWith("/")
           ? specifier.startsWith(name)
           : specifier === name || specifier.startsWith(`${name}/`),
@@ -293,7 +396,11 @@ function importsModelPython(text) {
   }
   return roots.some((raw) => {
     const root = raw.split(".")[0].toLowerCase();
-    return PYTHON_MODEL_MODULES.some((name) => root === name || root.startsWith(`${name}_`));
+    return PYTHON_ENTRYPOINT_MODEL_MODULES.some((name) =>
+      WHOLE_PYTHON_ENTRYPOINT_MODULES.has(name)
+        ? root === name
+        : root === name || root.startsWith(`${name}_`),
+    );
   });
 }
 
@@ -648,7 +755,7 @@ if (json) {
   console.log(
     nothingRead
       ? "Nothing was read, so nothing was ruled out. Point --dir at the app that talks to the model."
-      : NOTES[result.route],
+      : (verdict?.hint ?? NOTES[result.route]),
   );
   if (evidence.length > 0) {
     console.log("\nevidence:");

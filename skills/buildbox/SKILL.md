@@ -17,7 +17,8 @@ through the running app shows up on the Buildbox setup screen.
 ## Hard rules
 
 - **There is no Buildbox SDK.** Do not install, import, or invent one. Everything here
-  is standard OpenTelemetry plus, where needed, a published instrumentation package.
+  is standard OpenTelemetry plus, where needed, a published instrumentation package or
+  the framework's own first-party exporter.
 - **Do not hand-build OTLP payloads, use a hand-rolled `fetch` to the endpoint, or write
   a custom exporter.** Use standard OpenTelemetry exporters.
 - **Standard OpenTelemetry API spans are allowed only around real model and tool calls,
@@ -133,8 +134,8 @@ is a tracer provider that actually starts, and that the model calls run inside i
 The common miss: a Next.js app has `@vercel/otel` registered and the `ai` package in the
 same manifest, so the detector lands on route 1, and the tracer really is running. It is
 emitting HTTP spans and no model-call spans, because nothing turned the AI SDK's
-telemetry on. If the detector's evidence also lists the AI SDK, LangChain, or a bare
-client SDK, do that route's instrumentation step **as well as** the applicable env
+telemetry on. If the detector's evidence also lists the AI SDK, an agent framework, or a
+bare client SDK, do that route's instrumentation step **as well as** the applicable env
 block. A running tracer provider is not the same thing as instrumented model calls, and
 the difference looks like a connected setup with nothing in it.
 
@@ -162,15 +163,218 @@ processor with an HTTP/protobuf OTLP exporter. Configure its endpoint from
 environment. The agent references only those variable names and never reads either
 value. The existing exporter continues to read its unchanged standard variables.
 
+### Route 1 by framework: Pydantic AI, Mastra, Spectrum-TS
+
+Pydantic AI and Mastra produce model and tool spans through framework-owned telemetry.
+Spectrum-TS also owns a telemetry pipeline, but its `spectrum.*` spans cover transport
+work rather than model or tool calls. Each recipe below accounts for that difference.
+
+When the detector names one of these frameworks, use its recipe, but inspect the
+entrypoint first when the evidence also lists generic OpenTelemetry packages or an
+existing exporter. Follow route 1's exporter inspection before changing any variables.
+If the customer keeps that backend, leave the standard variables untouched and add the
+Buildbox HTTP/protobuf exporter through the dedicated `BUILDBOX_OTLP_TRACES_*` path
+exactly as route 1 prescribes. Write the three standard Buildbox lines only when Buildbox
+is the sole trace destination.
+
+#### Pydantic AI
+
+Signals: `pydantic-ai` or `pydantic-ai-slim` in the Python manifest. Both are real; the
+first is the batteries-included package and depends on the second.
+
+Work: Pydantic AI ships only the OpenTelemetry API, so complete "A running provider,
+first" (Python) unless the app already registers a provider. Then one line at startup:
+
+```python
+from pydantic_ai import Agent
+
+Agent.instrument_all()
+```
+
+Process-wide instrumentation is the primary form. Before using a per-agent form, read
+the installed `pydantic-ai` or `pydantic-ai-slim` version from the manifest or lockfile.
+The capability form below is for the current 2.x line; on a 1.x pin, use the earlier
+`Agent(..., instrument=True)` constructor or set `agent.instrument = True` instead.
+`Agent.instrument_all()` works across both lines and remains the primary recommendation.
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.capabilities import Instrumentation
+
+agent = Agent("openai:gpt-5.2", capabilities=[Instrumentation()])
+```
+
+Where the app keeps a provider of its own rather than the global one, hand it over:
+
+```python
+from pydantic_ai.models.instrumented import InstrumentationSettings
+
+Agent.instrument_all(InstrumentationSettings(tracer_provider=provider))
+```
+
+Pydantic AI sets nothing endpoint-related or header-related in code; it writes into
+whatever provider is registered. Use the environment or dedicated second-exporter path
+selected in the shared preamble above.
+
+Conversation id: native, and it is exactly the attribute Buildbox reads. Every agent run
+span carries `gen_ai.conversation.id`, the id goes onto baggage for the length of the run,
+and it is read back onto the child spans. Do not add the baggage span processor to a
+Pydantic AI app. It is redundant.
+
+The trap is that the id defaults to a fresh value per run. Pydantic AI takes it from the
+`conversation_id=` argument, then from the most recent one in `message_history`, and
+generates a new one when it has neither. An app calling `agent.run(prompt)` with no
+history and no argument gets a separate conversation every turn, which looks exactly like
+a propagation failure and is not one. The fix is one argument:
+`agent.run(prompt, conversation_id=chat.id)`. This is the first thing to check here.
+
+Two smaller ones. Token usage on the agent run span goes to Pydantic AI's own
+`gen_ai.aggregated_usage.*` names rather than `gen_ai.usage.*`, which its own docstring
+says is a custom namespace; the standard names are on the per-request model spans, so
+that is where to read usage. `InstrumentationSettings(version=...)` defaults to message
+shape 5, while version 6 is opt-in; leave the default unless the app already pins it.
+Message content rides along by default, which is what a `full` connection wants;
+`include_content=False` is there for a customer who does not want it.
+
+#### Mastra
+
+Signals: `@mastra/core` in `package.json`, usually with `@mastra/observability` beside it.
+The bare `mastra` package is the CLI rather than the library, so confirm `@mastra/core` is
+there before using this recipe. If it is absent, keep the bare package as evidence only
+and continue down the ladder using the other dependencies and entrypoint; do not return a
+Mastra verdict from the CLI alone.
+
+Work: Mastra exports through its own first-party package, `@mastra/otel-exporter`, and
+that exporter goes into the Mastra instance's observability config, not into a `NodeSDK`.
+Install `@mastra/otel-exporter` and `@opentelemetry/exporter-trace-otlp-proto` together:
+the exporter loads its transport with a lazy import at runtime and does not depend on the
+transport package. If it is missing, Mastra logs the loader error during exporter setup
+and disables the trace signal instead of throwing, so the app can keep running with no
+agent spans exported. Install both packages even though the failure is non-fatal.
+
+This route sets the endpoint and the header in code, so it uses the dedicated variables
+and not the three standard lines. `@mastra/otel-exporter` never reads
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. Run `scripts/pair.mjs --dedicated`, or have the
+customer paste the two `BUILDBOX_OTLP_TRACES_*` lines themselves, exactly as route 1's
+multi-backend path describes, and read both values from the environment so you never see
+the key:
+
+```ts
+import { Mastra } from "@mastra/core";
+import { Observability } from "@mastra/observability";
+import { OtelExporter } from "@mastra/otel-exporter";
+
+export const mastra = new Mastra({
+  observability: new Observability({
+    configs: {
+      default: {
+        serviceName: "my-service",
+        exporters: [
+          new OtelExporter({
+            provider: {
+              custom: {
+                endpoint: process.env.BUILDBOX_OTLP_TRACES_ENDPOINT!,
+                protocol: "http/protobuf",
+                headers: {
+                  Authorization: process.env.BUILDBOX_OTLP_TRACES_AUTHORIZATION!,
+                },
+              },
+            },
+            signals: { traces: true, logs: false },
+          }),
+        ],
+      },
+    },
+  }),
+});
+```
+
+Three of those lines are load-bearing. `protocol` defaults to `http/json`, so name
+`http/protobuf` rather than leaving it out. `provider` is documented as required even
+though the published types mark it optional, so treat it as required. And `signals.logs`
+is on by default and log export needs its own exporter package for the chosen protocol,
+so turning logs off avoids the loader error and a silently disabled log signal in a
+traces-only setup.
+
+Conversation id: native. Mastra maps the memory thread id onto `gen_ai.conversation.id`,
+on the agent run span and on the model spans under it, so an app using memory threads is
+already grouped and needs no baggage setup. An agent run without a thread leaves the
+attribute unset: pass an id through `tracingOptions.metadata.threadId` there. The separate
+`sessionId` metadata field is not mapped to any attribute, so it is not a substitute.
+
+The trap beyond the protocol default: Mastra's spans never pass through a `NodeSDK`. If
+the app also runs `@vercel/otel` or a `NodeSDK`, those are two independent pipelines. The
+NodeSDK will not see the agent spans, the Mastra exporter will not see the app's HTTP
+spans, and both have to be pointed at Buildbox to get both. The dedicated pair points the
+Mastra exporter; the three standard lines point the other pipeline, and they are inert for
+Mastra either way. That is route 1's trap in Mastra's shape.
+
+The `ai` package usually shows up in the manifest of a Mastra app, and the detector will
+list it as evidence. On this route that is often Mastra's own use of the AI SDK: those
+model calls already ride Mastra's pipeline and carry the thread id, so do not add route
+2's telemetry recipe on top of them. The same boundary applies to LangChain and bare
+client evidence: instrument calls the app makes itself outside Mastra with their route 2,
+3, or 4 recipe, but do not double-instrument calls Mastra owns.
+
+One more thing worth knowing: `@mastra/otel-exporter` ships no README on npm, so when an
+option name moves, Mastra's own reference doc is the place to check it, not `npm docs`.
+
+#### Spectrum-TS
+
+Signals: `spectrum-ts`, or any `@spectrum-ts/*` package, since a slim install has
+`@spectrum-ts/core` plus only the provider and server-adapter packages it uses. Adobe's
+`@react-spectrum/*` and `@spectrum-icons/*` are a UI library and are not this.
+
+Start with what Spectrum emits. With `telemetry: true`, Spectrum calls
+`@photon-ai/otel` in scoped mode (`register: false`). Its private provider sends
+transport-level `spectrum.*` spans to Photon, does not register an app-global provider,
+and does not create model or tool spans. Leave the customer's telemetry setting
+untouched unless the customer explicitly agrees to lose that vendor integration.
+
+Work: Buildbox needs a separate app-global provider and instrumentation for the actual
+model client. Complete "A running provider, first" for Node before importing the app,
+then inspect the model-call entrypoint and apply its route 2, 3, or 4 instrumentation as
+well. Spectrum's scoped provider can coexist with that global provider and shares the
+process context with it.
+
+Preserving Photon's destination makes this a keep-the-backend case. Do not put the three
+standard Buildbox lines in the process environment: `@photon-ai/otel` gives those
+variables precedence over its code-set Photon endpoint, which would silently redirect
+the vendor pipeline. Use `scripts/pair.mjs --dedicated` and configure the app-global
+HTTP/protobuf exporter from `BUILDBOX_OTLP_TRACES_ENDPOINT` and
+`BUILDBOX_OTLP_TRACES_AUTHORIZATION`, exactly as route 1's second-exporter path
+prescribes. If the app already has a global provider, add the Buildbox span processor to
+it instead of registering another provider. If Spectrum telemetry is already unset or
+false and no other trace backend exists, Buildbox is the sole destination and the normal
+three-line standard block is correct; do not change the telemetry setting merely to
+choose that branch.
+
+Do not call `setupOtel()` for the Buildbox pipeline. The package is a first-call-wins
+singleton even in scoped mode, so a call made after `Spectrum({ telemetry: true })`
+returns Spectrum's private handle and still registers nothing globally. `NodeSDK` is
+independent of that singleton. If the app already calls `setupOtel()` itself, inspect
+which call runs first and where that handle exports before editing it.
+
+Conversation id: Spectrum has no native `gen_ai.conversation.id` or `session.id`. Its
+natural chat key is `space.id`. In the app-global Buildbox pipeline, set that value on an
+app-created span as `gen_ai.conversation.id`, and put the same value on baggage around
+the active model call. The baggage span processor in "A running provider, first" then
+copies it onto the instrumented model and tool spans. This path is verifiable because
+those spans use the app-global provider. Spectrum's internal scoped handle is not exposed
+to the app, so do not promise that the same processor can mutate Spectrum's private
+vendor spans.
+
 ### Route 2: Vercel AI SDK
 
 Signals: the `ai` package in `package.json`, calls to `generateText`, `streamText`, or
 `generateObject`.
 
 Work: first read the installed `ai` major from the app's `package.json`, then use the
-matching recipe, then put the standard env block in place. The two majors carry the
-conversation and user ids by different mechanisms, and the wrong one does not typecheck,
-so the version is the first thing to establish, not the last.
+matching recipe, then put the applicable exporter path in place. A standalone AI SDK app
+uses the standard env block; a framework recipe or existing-backend case keeps the env
+choice from its shared preamble. The two majors carry the conversation and user ids by
+different mechanisms, and the wrong one does not typecheck, so the version is the first
+thing to establish, not the last.
 
 For `ai` major 6 or lower, turn on the SDK's built-in telemetry at every model call:
 
@@ -263,9 +467,13 @@ compiles fine under the dev server and fails in the customer's CI.
 
 ### A running provider, first
 
-Routes 3 through 5 instrument calls or create spans, but none can export without a
-running tracer provider. Complete one setup below before applying those routes. The
-exporters read the standard trace-scoped env block later in this skill.
+Routes 3 through 5 instrument calls or create spans, and the Pydantic AI recipe above
+turns on a framework's own, but none of them can export without a running tracer provider.
+Complete one setup below before applying those routes. The exporters read the standard
+trace-scoped env block later in this skill unless the applicable route 1 preamble selects
+the dedicated second-exporter path. Mastra is the exception because it builds its own
+pipeline. Spectrum-TS still needs the app-global Node provider for Buildbox even when its
+private Photon pipeline is active.
 
 Python: install `opentelemetry-sdk` and
 `opentelemetry-exporter-otlp-proto-http`, then initialize once at process startup:
@@ -366,10 +574,12 @@ construction.
 
 Signals: `langchain`, `@langchain/core`, `@langchain/langgraph`, `langgraph`.
 
-Work: complete "A running provider, first", register a published instrumentor, then put the
-standard env block in place. Buildbox reads both the
-OpenInference and the OpenLLMetry conventions, so either one is fine. Pick whichever the
-customer already has; if neither, pick one and stay with it.
+Work: complete "A running provider, first", register a published instrumentor, then put
+the applicable exporter path in place. A standalone LangChain app uses the standard env
+block; when this route is the extra model-call step inside a framework recipe, keep that
+recipe's exporter choice. Buildbox reads both the OpenInference and the OpenLLMetry
+conventions, so either one is fine. Pick whichever the customer already has; if neither,
+pick one and stay with it.
 
 Python, OpenInference:
 
@@ -403,16 +613,171 @@ replacement for the list.
 
 This goes in the process entrypoint, before the first chain or graph is built.
 
+### Route 3 by framework: Agno, CrewAI, DSPy
+
+Three more Python frameworks take route 3's shape exactly: complete "A running provider,
+first", then register a published OpenInference instrumentor at startup. None of these
+instrumentors carries a transport of its own or pulls in a gRPC exporter.
+
+Before applying any recipe, inspect the entrypoint first when the evidence also lists
+generic OpenTelemetry packages or an existing exporter. Follow route 1's exporter
+inspection before changing any variables. If the customer keeps that backend, leave the
+standard variables untouched and add the Buildbox HTTP/protobuf exporter through the
+dedicated `BUILDBOX_OTLP_TRACES_*` path exactly as route 1 prescribes. Write the three
+standard Buildbox lines only when Buildbox is the sole trace destination.
+
+One thing holds across all three, and it is the first thing to get right. OpenInference
+never emits `gen_ai.conversation.id`. Its convention is `session.id`, set with the
+`using_session("...")` context manager, and `user.id`, set with `using_user("...")`.
+Buildbox groups on `gen_ai.conversation.id` first and `session.id` second, so either one
+works: the baggage setup in "Always, on every route" gives you the first, and wrapping the
+run in `using_session(chat_id)` gives you the second. Pick one and stay with it.
+
+#### Agno
+
+Signals: `agno` in the Python manifest, sometimes with an extra, `agno[opentelemetry]`,
+`agno[arize]`, or `agno[os]`.
+
+Work: complete "A running provider, first" (Python), install
+`openinference-instrumentation-agno`, then one line at startup:
+
+```python
+from openinference.instrumentation.agno import AgnoInstrumentor
+
+AgnoInstrumentor().instrument()
+```
+
+`AgnoInstrumentor().instrument(tracer_provider=...)` is accepted too, for an app that
+keeps a provider outside the global one. Use the exporter path selected in the shared
+preamble above.
+
+Conversation id: Agno propagates one, as OpenInference's `session.id`. The instrumentor
+reads `session_id` and `user_id` off the run call and puts them on the span as `session.id`
+and `user.id`, so an app already calling `agent.run(..., session_id=chat_id, user_id=...)`
+is grouped with no further work. Anything else needs the baggage setup or `using_session`.
+
+Two traps. First, `agno.tracing.setup_tracing()` looks like the OTLP route and is not one:
+it installs this same instrumentor but writes the spans to a database for the AgentOS
+trace viewer. It also returns early when a real tracer provider is already registered, so
+it and your provider fight over the global. Whichever registers first wins, and the loser
+is silent: let `setup_tracing` run first and Buildbox gets nothing, register your provider
+first and the AgentOS trace view goes dark. Where the customer wants both, add your
+`BatchSpanProcessor` to the provider `setup_tracing` created rather than building a second
+provider.
+
+Second, the `agno[opentelemetry]` and `agno[arize]` extras drag in a gRPC exporter and
+`opentelemetry-distro`, whose auto-configuration may pick gRPC, which this endpoint does
+not accept. Install `opentelemetry-exporter-otlp-proto-http` explicitly and build the
+exporter in code, as "A running provider, first" does, rather than relying on the distro.
+
+`AGNO_TELEMETRY=false` turns off Agno's own anonymous per-run event to Agno. It has
+nothing to do with tracing, and customers conflate the two.
+
+#### CrewAI
+
+Signals: `crewai` in the Python manifest, often with `crewai-core` and `crewai-cli` on the
+same version pin. `crewai-tools` is a separate package.
+
+Work: complete "A running provider, first" (Python), install
+`openinference-instrumentation-crewai`, then one line at startup:
+
+```python
+from openinference.instrumentation.crewai import CrewAIInstrumentor
+
+CrewAIInstrumentor().instrument()
+```
+
+The instrumentor's README passes the provider explicitly,
+`CrewAIInstrumentor().instrument(tracer_provider=trace_provider)`; both forms work. CrewAI
+wrapper instrumentation supplies crew, agent, and tool structure, but Buildbox also
+requires model-call spans. Inspect the app's active LLM client and register its
+OpenInference instrumentor alongside CrewAI's. For example, an app using the OpenAI
+client also installs and registers `openinference-instrumentation-openai`. This client
+instrumentation is required, not an optional detail. Use the exporter path selected in
+the shared preamble above.
+
+The README recommends wrapper mode above for standard Python CrewAI apps. Event-listener
+mode is for AMP or low-code execution surfaced through CrewAI's event bus, and it creates
+LLM spans from `LLMCall*` events by default. Use that mode as the primary LLM source only
+for those apps. If the underlying client is also instrumented, pass
+`use_event_listener=True, create_llm_spans=False` to avoid duplicate model spans.
+
+Conversation id: nothing usable natively. CrewAI puts a `crew_context` entry on baggage,
+but that is the crew's identity, not a conversation, and there is no `session.id` and no
+user id. Use the baggage setup in "Always, on every route", or wrap the kickoff in
+`using_session(...)`.
+
+Three traps. Before applying this recipe, read the installed `crewai` version from the
+manifest or lockfile. These assumptions are for CrewAI's current 1.x major line, verified
+at 1.15.17: CrewAI has no LangChain dependency, and it deliberately does not hijack the
+global tracer provider. For an older pin, inspect CrewAI's dependency tree with `pip show
+crewai` or the lockfile; if CrewAI pulls in LangChain, instrument through the LangChain
+route as well, and verify tracer-provider behavior at the application entrypoint instead
+of trusting these current-version notes.
+
+CrewAI pins the OpenTelemetry SDK hard, to `~=1.42.0`, which means at or above 1.42 and
+below 1.43. Install `opentelemetry-sdk` and `opentelemetry-exporter-otlp-proto-http`
+without a version and let the resolver land inside that window; pinning them yourself
+outside it fails to resolve.
+
+And do not reach for `OTEL_SDK_DISABLED=true` to silence CrewAI's own product telemetry.
+It does silence it, and being a standard OpenTelemetry variable it also disables the
+customer's SDK, so nothing reaches Buildbox either. `CREWAI_DISABLE_TELEMETRY=true` is the
+one that does only what it says.
+
+#### DSPy
+
+Signals: `dspy` in the Python manifest, or `dspy-ai`, which is a compatibility alias
+package at the same version whose only dependency is `dspy`. Either name means DSPy.
+
+Work: complete "A running provider, first" (Python), install
+`openinference-instrumentation-dspy`, then one line at startup:
+
+```python
+from openinference.instrumentation.dspy import DSPyInstrumentor
+
+DSPyInstrumentor().instrument()
+```
+
+Use the exporter path selected in the shared preamble above.
+
+Conversation id: nothing native. DSPy has no session, conversation, thread, or user
+concept, so this is the baggage setup or `using_session`, and there is no shortcut.
+
+Two traps. The instrumentor's README install line is stale in two ways: it names the
+`dspy-ai` alias rather than `dspy`, and it installs `opentelemetry-exporter-otlp`, the
+meta-package that brings gRPC with it. Install `dspy` and
+`opentelemetry-exporter-otlp-proto-http` instead.
+
+The other is volume. DSPy is optimizer-heavy, and a `teleprompter.compile(...)` or
+`Evaluate(...)` run traces every candidate program against every example, so one command
+can emit far more spans than a day of serving traffic. We have not measured the multiple,
+so treat it as a thing to watch rather than a number: instrument the serving path first,
+and check what an optimizer run costs before pointing one at Buildbox. The `dspy[langchain]`
+extra is the one case where a LangChain instrumentor is also relevant; base `dspy` has no
+LangChain in it.
+
 ### Route 4: bare OpenAI, OpenAI Agents, Anthropic, or another client SDK
 
 Signals: `openai`, `@openai/agents`, `openai-agents`, `@anthropic-ai/sdk`, `anthropic`,
 and no framework above them.
 
 Work: complete "A running provider, first", then add the matching instrumentor for that
-client and put the standard env block in place. Same shape as
-route 3, different package: the OpenInference or OpenLLMetry instrumentation for OpenAI
-or Anthropic, registered once at startup. OpenAI Agents uses the matching instrumentor,
+client and put the applicable exporter path in place. A standalone client app uses the
+standard env block; when this route is the extra model-call step inside a framework
+recipe, keep that recipe's exporter choice. Same shape as route 3, different package:
+the OpenInference or OpenLLMetry instrumentation for OpenAI or Anthropic, registered once
+at startup. OpenAI Agents uses the matching instrumentor,
 `openinference-instrumentation-openai-agents`.
+
+On Node that instrumentor works differently from the rest, and its default will take a
+working setup away. `@arizeai/openinference-instrumentation-openai-agents` does not patch
+the module: it registers a tracing processor with the `@openai/agents` SDK's own tracing,
+and its `exclusiveProcessor` option defaults to true, which replaces every trace processor
+already registered with the SDK. On an app that already has any SDK trace processor,
+including OpenAI's own default dashboard exporter or a processor sending agent traces
+elsewhere, pass `exclusiveProcessor: false` so both survive. Because it hooks the SDK's
+own tracing rather than `require`, the ESM line below does not apply to it.
 
 If the app uses two clients, register both instrumentors.
 
@@ -488,9 +853,13 @@ node <skill dir>/scripts/pair.mjs --code <the pairing code> \
   --env-path <app environment file>
 ```
 
-Add `--dedicated` on the route-1 path where the customer keeps an existing trace backend.
-It writes the two `BUILDBOX_OTLP_TRACES_*` variables instead of the three standard ones,
-and the second-exporter code in route 1 reads those.
+Add `--dedicated` on the code-configured paths: route 1 when the customer keeps an
+existing trace backend, including Spectrum preserving Photon, and the Mastra recipe,
+whose exporter takes its endpoint and header from code. It writes the two
+`BUILDBOX_OTLP_TRACES_*` variables instead of the three standard ones, and the exporter
+code in those recipes reads them. A second Buildbox pipeline that needs the standard
+variables needs a second pairing code: click "New command" on the setup screen, then run
+`pair.mjs` again without `--dedicated`.
 
 The code works once and expires after fifteen minutes. Exit 3 means it is spent or
 expired and nothing was written: ask the customer to click "New command" on the Buildbox
@@ -525,9 +894,14 @@ before anything else.
 ### The lines themselves
 
 For a single trace backend, these are the three standard lines, with exactly these names.
-They apply on every route unless route 1 preserves an existing backend with the
-code-configured second exporter described above. `pair.mjs` writes exactly these; a
-customer pasting by hand pastes exactly these.
+They apply on every route but one: route 1 preserving an existing backend leaves them
+unset and uses the dedicated `BUILDBOX_OTLP_TRACES_*` pair instead, because setting them
+would redirect the backend the customer is keeping. Spectrum with its Photon telemetry
+preserved is one such case. Mastra needs the dedicated pair too,
+for a different reason and without that prohibition: `@mastra/otel-exporter` takes its
+endpoint and header from code and never reads the standard lines, so they are inert for
+it, and they stay available for a `NodeSDK` or `@vercel/otel` running beside it.
+`pair.mjs` writes exactly these; a customer pasting by hand pastes exactly these.
 
 ```bash
 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=<endpoint URL from the setup screen>
@@ -557,7 +931,9 @@ bodies. It does not speak gRPC. Several SDKs default to gRPC, and a gRPC exporte
 this endpoint fails quietly with nothing on the Buildbox side to show for it. This is the
 single most common reason a setup looks finished and no traces arrive. Keep the
 trace-scoped name: an existing `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc` overrides a
-generic protocol setting.
+generic protocol setting. Spectrum-TS with Photon preserved does not receive this
+standard block at all: its private vendor transport stays HTTP/JSON, and the concrete
+Buildbox exporter on the dedicated path fixes the app-global transport to HTTP/protobuf.
 
 **Make the selected app's environment file safe before the key exists.** This is the file
 step 1 settled: the one that will supply the variables to the running app. A Next.js run
@@ -571,9 +947,13 @@ means the app's environment file is already tracked, so stop and have the custom
 untrack it. Re-run both checks and verify that the file is ignored and untracked before
 any key exists. Only then redeem the pairing code, or, with no code, have the customer
 put the applicable key lines in that file themselves. Either way you do not read the key
-line back. For the code-configured multi-backend path, the applicable key lines are
-`BUILDBOX_OTLP_TRACES_ENDPOINT` and `BUILDBOX_OTLP_TRACES_AUTHORIZATION`; the three
-standard lines must remain unset for Buildbox. If the app deploys somewhere, set the
+line back. On the code-configured paths, route 1's second exporter and the Mastra recipe,
+the applicable key lines are `BUILDBOX_OTLP_TRACES_ENDPOINT` and
+`BUILDBOX_OTLP_TRACES_AUTHORIZATION`. Where route 1 is preserving an existing backend, the
+three standard lines must also remain unset for Buildbox, since that is what protects the
+backend. On Mastra there is nothing to protect: the standard lines are simply inert for
+Mastra's own exporter, and they are still how a second pipeline in the same app gets
+pointed at Buildbox. If the app deploys somewhere, set the
 applicable variables in that environment too; a local environment file does not reach a
 container or a serverless function.
 
@@ -620,6 +1000,11 @@ already has for a thread or a chat, not a new one.
 Single-shot agents with no follow-up turns can skip this. So can a Vercel AI SDK app that
 already carries the ids through its route 2 recipe: the per-call `enrichSpan` on major 7,
 the `metadata` keys on major 6. An AI SDK app that does neither still needs this section.
+Two frameworks carry the attribute themselves and should be left alone here: Pydantic AI,
+once its runs are passed a `conversation_id`, and Mastra, on agent runs that have a memory
+thread. Agno is the near miss: it emits `session.id` rather than
+`gen_ai.conversation.id`, which Buildbox groups on second, so an Agno app passing
+`session_id` is grouped and does not need this either.
 
 **Suggest a user id.** If the app already knows who is talking, set `user.id` on the same
 spans from that existing value. If it does not, propose the change in one sentence and
@@ -717,7 +1102,9 @@ Not when the code compiles. Not when a test span goes through. Done is:
    If this exits 1, wait 60 seconds and run the same command again, same baseline, before
    you touch any code. Do not send more turns: repeating the interaction adds conversations
    and moves the target out from under the baseline you already have. A split that clears
-   on the second run was assembly catching up. Only a second failure is rung 6.
+   on the second run was assembly catching up. A second failure is rung 6 only when spans
+   were accepted and the conversation delta is missing or split. If `spans_accepted` is
+   still zero, use rungs 1 through 5b instead.
 
    It reads the endpoint and the key out of the environment file, asks Buildbox, and
    prints the answer:
@@ -725,12 +1112,13 @@ Not when the code compiles. Not when a test span goes through. Done is:
    "conversations_seen": 1}`, or
    `{"first_trace_at": null, "spans_accepted": 0, "conversations_seen": 0}` when nothing
    has arrived yet. The answer carries no secret. Exit 0 means spans arrived and the delta
-   was met and settled. Exit 1 means still nothing after the wait, or the delta never
-   arrived, or the count settled above it, and its message says which: all three
-   conversation cases are rung 6, not a missing exporter. Exit 2 when the baseline plus the
-   expected conversations reaches the count's 1000 cap means there is no exact number to
-   measure a delta against, so read the grouping off the Sessions screen instead. Exit 5
-   means the key in the file is not the live one, which is rung 3.
+   was met and settled. Exit 1 means still nothing after the wait, the delta never
+   arrived, or the count settled above it, and its message says which. Flat zero spans
+   belong to rungs 1 through 5b. With `spans_accepted > 0`, a missing delta or a settled
+   overshoot belongs to rung 6. Exit 2 when the baseline plus the expected conversations
+   reaches the count's 1000 cap means there is no exact number to measure a delta against,
+   so read the grouping off the Sessions screen instead. Exit 5 means the key in the file
+   is not the live one, which is rung 3.
 
    Spans arriving is not the same as the setup working. On Next.js, `@vercel/otel`'s HTTP
    spans count towards `spans_accepted`, so that number can go green on an app with no
@@ -797,10 +1185,13 @@ below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 
 1. **Exporter protocol.** On the standard path, is
    `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` set and reaching an
    environment-configured exporter, or is the concrete exporter HTTP/protobuf? On the
-   multi-backend path, is the code-configured Buildbox exporter HTTP/protobuf? Turn on
+   code-configured paths, route 1's second exporter and the Mastra recipe, is the Buildbox
+   exporter HTTP/protobuf, and on Mastra is the transport package installed at all? Turn on
    the exporter's own logging and read the effective transport when it is unclear. A
    gRPC exporter against this endpoint produces no traces and no obvious error. This is
-   the top cause.
+   the top cause. On Spectrum-TS, check the app-global Buildbox exporter here; the private
+   Photon transport is a separate HTTP/JSON pipeline and does not answer whether Buildbox
+   receives the model spans.
 
 2. **A leftover general endpoint variable on the standard path.** Our variable of record is
    `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. If the environment also has
@@ -820,7 +1211,7 @@ below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 
 
 3. **401 from the endpoint.** The key is wrong, truncated, or has been rotated since it
    was pasted. On the standard path, have the customer check
-   `OTEL_EXPORTER_OTLP_TRACES_HEADERS` themselves for `%20`. On the multi-backend path,
+   `OTEL_EXPORTER_OTLP_TRACES_HEADERS` themselves for `%20`. On the code-configured paths,
    have them check `BUILDBOX_OTLP_TRACES_AUTHORIZATION` themselves for a literal space
    and confirm that code passes it to the Buildbox exporter's `headers` option. Ask only
    for confirmation that the format is correct, never for the line or its value. If the
@@ -841,6 +1232,18 @@ below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 
    reading from a different env source are all common. Restart, and set the variables
    where that environment actually reads them from.
 
+5b. **On Mastra or Spectrum-TS, the required pipeline is missing or leads nowhere.** On
+   Mastra, check that the app's
+   agent spans go through `@mastra/otel-exporter` and not a `NodeSDK` or `@vercel/otel`
+   that never sees them, and that the transport package for the configured protocol is
+   installed. A missing package logs an error and disables that signal; it does not throw.
+   On Spectrum-TS, leave the customer's vendor telemetry setting alone and check that an
+   app-global provider starts independently, the active model client is instrumented, and
+   its Buildbox exporter reads the dedicated variables when Photon is preserved or the
+   standard variables when Buildbox is the sole destination. A Buildbox `setupOtel()` call
+   made after Spectrum starts is a no-op because Spectrum spent that singleton; use the
+   global `NodeSDK` path from the recipe instead.
+
 6. **Spans exist but the conversations do not.** `status.mjs --baseline` exits 1 with
    spans accepted, either because the delta never arrived or because the count settled
    above it, or traces arrive and every conversation is one turn long: the conversation id
@@ -849,9 +1252,11 @@ below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 
    check judges the settled value and why you re-run it once before coming here. Go back to
    the baggage section, or for an AI SDK app, to
    the route 2 recipe for the installed major, the per-call `enrichSpan` on major 7 and
-   the `metadata` option on major 6. On Next.js, check that the spans are model-call spans
-   at all and not just `@vercel/otel`'s HTTP spans, which is the same failure one step
-   earlier.
+   the `metadata` option on major 6. On a Pydantic AI app this is almost always the missing
+   `conversation_id=` argument, which gives one conversation per turn with no baggage
+   involved; on Mastra it is an agent run with no memory thread. On Next.js, check that the
+   spans are model-call spans at all and not just `@vercel/otel`'s HTTP spans, which is the
+   same failure one step earlier.
 
 7. **Conversations arrive without message text on a `full` connection.** The instrumentor
    is not capturing content, which is a producer setting, not a Buildbox one. The official
@@ -871,11 +1276,18 @@ instrumentor's own README before rewriting it.
 - OpenInference: `openinference-instrumentation-langchain`,
   `openinference-instrumentation-openai`,
   `openinference-instrumentation-openai-agents`,
-  `openinference-instrumentation-anthropic` (Python),
+  `openinference-instrumentation-anthropic`,
+  `openinference-instrumentation-agno`, `openinference-instrumentation-crewai`,
+  `openinference-instrumentation-dspy` (Python),
   `@arizeai/openinference-instrumentation-*` (Node).
 - OpenLLMetry: `opentelemetry-instrumentation-langchain`,
   `opentelemetry-instrumentation-openai`, `opentelemetry-instrumentation-anthropic`
   (Python), `@traceloop/*` (Node).
+- First-party framework telemetry: `@mastra/otel-exporter` with
+  `@opentelemetry/exporter-trace-otlp-proto` beside it (Mastra), and `@photon-ai/otel`
+  (Spectrum-TS), which `@spectrum-ts/core` already depends on for its private Photon
+  transport spans. Spectrum still needs core OTel plus the active model-client
+  instrumentation for Buildbox. Pydantic AI needs no instrumentation package at all.
 - Core OTel: `opentelemetry-sdk` and `opentelemetry-exporter-otlp-proto-http` (Python),
   `@opentelemetry/sdk-node` and `@opentelemetry/exporter-trace-otlp-proto` (Node),
   `@vercel/otel` on Next.js.
@@ -922,10 +1334,11 @@ it. It replaces a variable already in the file where it stands, keeping any `exp
 prefix, drops later duplicate lines for the same variable, and appends the rest. It prints
 the variable names it wrote and the status URL, nothing else. Exit 3 means the code is
 spent or expired, exit 4 means Buildbox could not be reached, exit 2 means the arguments
-were wrong or the environment file cannot be read or written. On all three nothing was
-written and the code is still good. Exit 6 is the exception: the code was redeemed and the
-write failed, so the key is gone and the customer needs a new command. The endpoint has to
-be https, or http on localhost for a developer's own machine.
+were wrong or the environment file cannot be read or written. Exits 2 and 4 write nothing
+and leave the code usable. Exit 3 writes nothing but needs a new command because the code
+is already spent or expired. Exit 6 means the code was redeemed and the write failed, so
+the key is gone and the customer needs a new command. The endpoint has to be https, or
+http on localhost for a developer's own machine.
 
 **`status.mjs`** asks Buildbox whether the spans arrived, using the key already in the
 environment file.
