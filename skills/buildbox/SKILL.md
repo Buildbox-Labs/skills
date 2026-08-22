@@ -1,6 +1,6 @@
 ---
 name: buildbox
-description: Connect a customer's AI agent to Buildbox agent analytics over OpenTelemetry. Use when someone asks to connect, set up, hook up, or send traces to Buildbox, or provides a Buildbox endpoint or gives a Buildbox pairing code. Detects the framework, writes standard OTel config, and loops until a real interaction shows up on the Buildbox setup screen.
+description: Connect a customer's AI agent to Buildbox. Two jobs: send their production traces over OpenTelemetry (the default), or make their agent reachable for Buildbox Testing with the connector bridge (TESTING-CONNECTOR.md). Use when someone asks to connect, set up, hook up, or send traces to Buildbox, provides a Buildbox endpoint or pairing code, or has a Buildbox connector key, no public endpoint, or wants Buildbox Testing to reach an agent that runs on a laptop, in a private network, or behind a chat channel.
 ---
 
 # Connect an agent to Buildbox
@@ -14,11 +14,31 @@ Your job in this skill: get the customer's app emitting OTel spans for its model
 tool calls, point the exporter at Buildbox, and keep going until a real interaction
 through the running app shows up on the Buildbox setup screen.
 
+## Two jobs, pick one first
+
+This skill covers two different things a customer means by "connect to Buildbox".
+
+- **Send my traces** (the rest of this file). Their running app emits
+  OpenTelemetry spans to a Buildbox endpoint, and Buildbox analyses the
+  conversations their real users have. Signals: a Buildbox endpoint URL, a
+  pairing code, an ingest key, "traces", "no data on my setup screen".
+- **Let Buildbox Testing reach my agent**: read `TESTING-CONNECTOR.md` in this
+  skill directory and follow it instead of the routes below. Signals: a
+  connector key (`bbx_connector_...`), the Testing page, "no public endpoint",
+  an agent on a laptop or inside a private network, or an agent reached only
+  through a chat channel.
+
+If both are wanted, do the traces first and then the connector: they are
+independent and neither depends on the other.
+
 ## Hard rules
 
 - **There is no Buildbox SDK.** Do not install, import, or invent one. Everything here
   is standard OpenTelemetry plus, where needed, a published instrumentation package or
-  the framework's own first-party exporter.
+  the framework's own first-party exporter. (The `buildbox-bridge` package in
+  `TESTING-CONNECTOR.md` is not an SDK and is not part of trace setup: it is a separate
+  process that lets Buildbox Testing reach an agent with no endpoint, and it never
+  touches the app's traces.)
 - **Do not hand-build OTLP payloads, use a hand-rolled `fetch` to the endpoint, or write
   a custom exporter.** Use standard OpenTelemetry exporters.
 - **Standard OpenTelemetry API spans are allowed only around real model and tool calls,
@@ -39,10 +59,12 @@ through the running app shows up on the Buildbox setup screen.
 
 Run the detector that ships with this skill. Run it from the customer's repo root, and
 spell out the script path from wherever the skill is installed, because the scripts scan
-and resolve paths against the directory you run them from, not against their own:
+and resolve paths against the directory you run them from, not against their own. That
+directory persists between your commands, so an earlier `cd` into the app is still in
+effect here: anchor each run to the repo root in the same command.
 
 ```bash
-node <skill dir>/scripts/detect.mjs --json
+cd <repo root> && node <skill dir>/scripts/detect.mjs --json
 ```
 
 Add `--dir <app path>` when the customer already named the app, and give the same kind of
@@ -70,13 +92,15 @@ message, not four:
 
 4. **The environment file**, when `env_file` does not match how the app actually runs.
 
-Trust `restart` and `env_file` only from a run that named the app, either `--dir <app>` or
-a single candidate. From a multi-app root the detector reports both as null with a note
-saying so, because the root's own `dev` script starts a different app and the root
-environment file is not the one the app reads. Those two nulls are the expected answer
-there, and the fix is the `--dir` re-run, not a question. Check `env_file.exists` too: a
-safety verdict about a file that is not there yet is a verdict about a path, and the file
-the app really loads may be elsewhere.
+Trust `route`, `framework`, `restart`, and `env_file` only from a run that named the app,
+either `--dir <app>` or a single candidate. From a multi-app root the detector reports the
+route as null and the framework as `undetermined`, with `restart` and `env_file` null too
+and a note saying so, because the root's own `dev` script starts a different app, the root
+environment file is not the one the app reads, and the route belongs to whichever app
+calls the model. Those nulls are the expected answer there, and the fix is the `--dir`
+re-run, not a question. Check `env_file.exists` too: a safety verdict about a file that is
+not there yet is a verdict about a path, and the file the app really loads may be
+elsewhere.
 
 Then make that file safe, before any key exists. `env_file_safe` reports where it stands:
 
@@ -407,6 +431,14 @@ needs a tracer provider. On Next.js that is `instrumentation.ts` with
 `@vercel/otel`; on plain Node it is `@opentelemetry/sdk-node` started before the app
 code. If neither exists, add one, then come back to this step.
 
+`@vercel/otel` keeps its OpenTelemetry packages as peer dependencies rather than bundling
+them, so name them on the install line instead of relying on the package manager to add
+them: `@opentelemetry/api` alongside it, plus `@opentelemetry/sdk-logs`,
+`@opentelemetry/api-logs`, and `@opentelemetry/instrumentation`. Auto-installed peers are
+a package-manager setting, not a guarantee, and a missing one surfaces as a
+module-not-found at startup rather than as an error at install. Read the installed
+version's own peer list before assuming those are all of them.
+
 For `ai` major 7, install `@ai-sdk/otel` and register its integration once at application
 startup, alongside the tracer provider:
 
@@ -504,6 +536,36 @@ so a provider set up in a module that is imported before `load_dotenv()` runs po
 
 If the Python app is launched through a CLI, `opentelemetry-instrument` can auto-init
 the provider and exporter instead of this code setup.
+
+Where the app needs the conversation id copied off baggage, the processor that does it
+goes in this same setup, in place of the single `add_span_processor` line above:
+
+```python
+from opentelemetry import baggage
+from opentelemetry.sdk.trace import SpanProcessor
+
+COPY = ("gen_ai.conversation.id", "user.id")
+
+
+class FromBaggage(SpanProcessor):
+    def on_start(self, span, parent_context=None):
+        for key in COPY:
+            value = baggage.get_baggage(key, context=parent_context)
+            if value:
+                span.set_attribute(key, value)
+
+
+provider.add_span_processor(FromBaggage())
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+```
+
+Read the baggage in `on_start`, off the parent context the method is handed rather than
+the active one, and register it before the `BatchSpanProcessor` so the attribute is on the
+span before it is queued. `on_end` is the trap: it compiles, it runs, and it sets nothing,
+because the span has already ended and its attributes are read-only by then, so both the
+grouping and the user attribution the definition of done checks go missing with no error
+anywhere. Subclassing `SpanProcessor` gives you no-op `on_end`, `shutdown`, and
+`force_flush`, so `on_start` is the only method to write.
 
 Node: install `@opentelemetry/sdk-node` and
 `@opentelemetry/exporter-trace-otlp-proto`, then start the SDK before importing app
@@ -781,6 +843,22 @@ own tracing rather than `require`, the ESM line below does not apply to it.
 
 If the app uses two clients, register both instrumentors.
 
+Before installing the instrumentor, read the floor it declares on the client SDK, and
+compare it with the version the app pins. On Python this is the trap of the route: every
+`openinference-instrumentation-openai` from 0.1.25 up requires `openai >= 1.69.0`, and
+against an older pin the instrumentor logs `DependencyConflict` at startup, instruments
+nothing, and lets the app run. That is the same silent failure as the ESM trap below,
+wearing different clothes. Install the last instrumentor release that supports the pinned
+client rather than bumping the customer's SDK, and pin that version with a comment saying
+which client version it is for. Setup is not the place to move a dependency the app's own
+code is written against.
+
+One more Python pin sits underneath it: recent `opentelemetry-instrumentation` releases
+(0.64b0 and later) allow `wrapt` 2.x, which renamed the keyword arguments older
+instrumentors pass. Whenever an older instrumentor is installed alongside them, the
+symptom is `TypeError: wrap_function_wrapper() got an unexpected keyword argument 'module'`
+at import time, and the fix is `wrapt<2` beside the pinned instrumentor.
+
 Node apps that import the client as an ES module need one more line. The
 instrumentations list on `NodeSDK` patches `require` calls only, so an `import Anthropic
 from "@anthropic-ai/sdk"` (or `import OpenAI from "openai"`) is never touched, the tracer
@@ -848,10 +926,15 @@ Buildbox, writes the lines it gets back into the environment file, and prints on
 variable names and the status URL. You never see the key.
 
 ```bash
-node <skill dir>/scripts/pair.mjs --code <the pairing code> \
+cd <repo root> && node <skill dir>/scripts/pair.mjs --code <the pairing code> \
   --endpoint <the endpoint from the prompt> \
   --env-path <app environment file>
 ```
+
+The `cd` is part of the command, not a habit. This is the one call in the skill that
+spends something, and a shell left in the app directory by an earlier command makes it die
+with `MODULE_NOT_FOUND` before it posts anything. The code is unspent when that happens:
+fix the path and run the same code again rather than asking for a new command.
 
 Add `--dedicated` on the code-configured paths: route 1 when the customer keeps an
 existing trace backend, including Spectrum preserving Photon, and the Mastra recipe,
@@ -994,8 +1077,8 @@ await context.with(carried, async () => {
 
 Then copy the baggage value onto spans as an attribute, either with a span processor that
 reads baggage on start, or by setting `gen_ai.conversation.id` explicitly on the spans you
-create. The Node span processor is in "A running provider, first". Use the id your app
-already has for a thread or a chat, not a new one.
+create. The span processor is in "A running provider, first", written out in both Python
+and Node. Use the id your app already has for a thread or a chat, not a new one.
 
 Single-shot agents with no follow-up turns can skip this. So can a Vercel AI SDK app that
 already carries the ids through its route 2 recipe: the per-call `enrichSpan` on major 7,
@@ -1028,6 +1111,23 @@ Not when the code compiles. Not when a test span goes through. Done is:
    environment. Every route in this skill edits application source, and a dev server is
    not a typechecker. Do this before the restart, so a broken edit shows up here and not
    in the customer's CI.
+
+   Judge it by the exit status, read straight off the bare command. Run these as two
+   commands in the same terminal, not as one compound command:
+
+   ```bash
+   npx tsc --noEmit
+   echo "typecheck exit: $?"
+   ```
+
+   The first command's status is the result, and any nonzero status means the typecheck
+   failed.
+
+   Quiet output is not a pass. And the shape agents reach for,
+   `npm run typecheck 2>&1 | tail -20; echo "${PIPESTATUS[0]}"`, is bash-only: under zsh
+   the array is `$pipestatus` and `$PIPESTATUS` expands to nothing at all, so the echo
+   prints a blank line and nothing looks wrong. That is an unfalsifiable pass, which is
+   worse than a failure you can see.
 2. **Restart the app yourself** when the restart command is a local one. First find out
    what is already running, with `pgrep -f <the command>` or by checking the port. Stop
    only a process you started, or the app's own process on its port, and never a bare
@@ -1036,13 +1136,24 @@ Not when the code compiles. Not when a test span goes through. Done is:
    restarted, from its own startup line in the log or with `lsof -i :<port>`, and not with
    an HTTP request: a hot reloader often does not re-read the app's environment file, and
    from here to the end of step 4 the app has to stay quiet, so a `curl /` readiness probe
-   is a request like any other. When the app only runs somewhere you cannot reach, ask the
-   customer to restart it. Leave the app in the state you found it or running, and say in
-   your summary which one. If you started it as a background task in a headless session,
-   say that too, and give the customer the one command that brings it up in their own
-   terminal. If you redirect the app's output to a log file, put that file inside the
-   app directory, ignored by git, or give it a unique name; never a fixed `/tmp` path
-   another run may already be using.
+   is a request like any other.
+
+   A reloader also cannot pick up a changed start command. `node --watch`, `nodemon`, and
+   `uvicorn --reload` re-execute with the argv they were launched with, so a new
+   `--import ./tracing.mjs`, a `-r`, or a different entry file in the `dev` or `start`
+   script takes effect only after a real stop and start. A file save is not enough, and
+   the result of skipping it is a running app with no tracer in it: the silent
+   zero-span setup this skill keeps warning about, one restart short.
+
+   When the app only runs somewhere you cannot reach, ask the customer to restart it.
+   Leave the app in the state you found it or running, and say in your summary which one.
+   If you started it as a background task in a headless session, that process ends when
+   the session does, so say that plainly rather than telling the customer the app is still
+   running, and give them the one command that brings it up in their own terminal. If you
+   redirect the app's output to a log file, put that file inside the app directory,
+   ignored by git, or give it a unique name; never a fixed `/tmp` path another run may
+   already be using. Append to it with `>>` rather than truncating it with `>`, because
+   the customer may already be writing to or tailing that file.
 3. **Read the conversation baseline, then perform one real interaction yourself, two
    turns under one conversation id.** The baseline first, because the check in step 4 is
    a delta and the number has to come from before the turns:
@@ -1077,6 +1188,11 @@ Not when the code compiles. Not when a test span goes through. Done is:
    the app's field is called, and never a real person's email address or account. These
    turns are yours, not a customer's, and that value is what Buildbox hashes and attributes
    the conversation to.
+
+   When the app has no user field at all, use a placeholder conversation id only, set no
+   user, and say so in the summary. Do not add a field to a request body, a header, or a
+   session shape to make one exist: that is the contract change "Always, on every route"
+   rules out, and it is not worth making for two turns of your own.
 4. **Wait for the conversation to land**, not just a span. After the two turns:
 
    ```bash
@@ -1128,6 +1244,9 @@ Not when the code compiles. Not when a test span goes through. Done is:
    check.
 5. **The setup screen is the customer's signal.** Once the status read is green, point
    them at it: it flips from "Waiting for your first trace" to showing traces arriving.
+   Say once that the setup screen and the Sessions page show this same count as sessions:
+   a customer reading "2 sessions" back to you is agreeing with your
+   `conversations_seen: 2`, not reporting a second thing.
 6. For a `full` connection, both checks above only confirm trace arrival. After a few
    minutes, have the customer open Sessions from Home and check that the real interaction
    appears with turns before treating message capture as verified.
@@ -1135,7 +1254,9 @@ Not when the code compiles. Not when a test span goes through. Done is:
    - The step 4 check, verbatim: the command, its exit code, and the settled
      `conversations_seen` against the expected target.
    - Which state you left the app in, running or stopped, plus the one command that brings
-     it up in the customer's own terminal when you started it as a background task.
+     it up in the customer's own terminal when you started it as a background task. If that
+     background task belongs to a headless session, say it ends with the session rather
+     than that the app is still running.
    - What the customer does next: the setup screen from step 5, and on a `full` connection
      the Sessions check from step 6.
    - Which environment variables have to be set again in the deployment platform's secret
@@ -1209,6 +1330,15 @@ below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 
    you saw the warning and nothing is arriving, allow the script, reinstall, and read the
    exporter's own logging. Do not chase it while spans are arriving.
 
+2c. **`DependencyConflict` in the app's own startup log, on Python.** The instrumentor
+   found a client SDK below the version floor it declares, said so once, and then
+   instrumented nothing. The provider starts, the app serves, and no model span is ever
+   created, which is the Node ESM `manuallyInstrument` failure with a different cause.
+   Read the app's startup output rather than trusting a clean import. The fix is in route
+   4: install the last instrumentor release that supports the pinned client. Its
+   neighbour, `TypeError: wrap_function_wrapper() got an unexpected keyword argument
+   'module'` at import time, wants `wrapt<2`.
+
 3. **401 from the endpoint.** The key is wrong, truncated, or has been rotated since it
    was pasted. On the standard path, have the customer check
    `OTEL_EXPORTER_OTLP_TRACES_HEADERS` themselves for `%20`. On the code-configured paths,
@@ -1270,8 +1400,11 @@ below apply. It backs off on its own when Buildbox rate limits the read. Exit 5 
 ## Instrumentation packages
 
 All published, none from Buildbox. Install the current version and let the lockfile pin
-it. These APIs move between majors, so when an init snippet stops matching, check the
-instrumentor's own README before rewriting it.
+it, unless the app pins a client SDK below the floor that version declares: then install
+the last instrumentor release that supports the app's pin, and pin it with a comment,
+rather than bumping the customer's client. Route 4 has the detail and the failure it
+prevents. These APIs move between majors, so when an init snippet stops matching, check
+the instrumentor's own README before rewriting it.
 
 - OpenInference: `openinference-instrumentation-langchain`,
   `openinference-instrumentation-openai`,
@@ -1297,6 +1430,18 @@ instrumentor's own README before rewriting it.
 Three scripts ship in this skill's `scripts/` directory. All three are plain Node with no
 dependencies, and none of them prints the ingest key or the pairing code.
 
+Every path they take, `<skill dir>`, `--dir`, and `--env-path`, resolves against the
+directory your shell is in when the command runs, and that directory persists between
+commands: a `cd` in an earlier command is still in effect in this one. So run each script
+as one command that starts from the repo root, or give absolute paths:
+
+```bash
+cd <repo root> && node <skill dir>/scripts/detect.mjs --json
+```
+
+The failure is a `MODULE_NOT_FOUND` on the script itself, which costs a turn on
+`detect.mjs` and reads like a bad pairing code on `pair.mjs`.
+
 **`detect.mjs`** reads the app's `package.json`, `pyproject.toml`, and `requirements.txt`
 and reports which route applies, plus the facts step 1 would otherwise have to ask for.
 
@@ -1309,13 +1454,18 @@ node <skill dir>/scripts/detect.mjs --dir ./apps/agent --json
 env_file_safe, note}`. It reads files only: no network, no writes. It is a starting point,
 not a verdict. Confirm the route against the entrypoint before you edit anything.
 
-Three fields need reading carefully. `restart` and `env_file` come back null, with `note`
-saying to re-run with `--dir <app>`, whenever there is more than one app candidate and no
-`--dir`: at a monorepo root the answers would describe the wrong app. `env_file.exists`
-is false when the file the app would read is not there yet, and `env_file_safe` still
-answers for that path, because the ignore rule has to be in place before the key is
-written. A Python `restart` may carry `source: "inferred from FastAPI entrypoint"`, which
-is worked out from the code rather than read from a manifest, so confirm it before you run
+Some fields need reading carefully. `route`, `framework`, `restart`, and `env_file` all
+come back null or `undetermined`, with `note` saying to re-run with `--dir <app>`,
+whenever there is more than one app candidate and no `--dir`: at a monorepo root the
+answers would describe the wrong app, and a route read off a root manifest is usually
+route 5, the one route that writes new code. The `evidence` list still holds whatever was
+matched. A workspace root that declares members and no dependencies of its own is left out
+of `apps` altogether, so a workspace with one member settles on that member and answers
+normally. `env_file.exists` is false when the file the app would read is not there yet,
+and `env_file_safe` still answers for that path, because the ignore rule has to be in
+place before the key is written. A Python `restart` may carry
+`source: "inferred from FastAPI entrypoint"`, which is worked out from the code rather
+than read from a manifest, so confirm it before you run
 it; under a `src/` layout it also carries a `note`, because an installed package is
 usually imported without the `src.` prefix and then uvicorn needs `--app-dir src`. When
 the path cannot be a Python module at all, a hyphen in a directory name for instance,
