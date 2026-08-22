@@ -1,6 +1,6 @@
 ---
 name: buildbox
-description: Connect a customer's AI agent to Buildbox. Two jobs: send their production traces over OpenTelemetry (the default), or make their agent reachable for Buildbox Testing with the connector bridge (TESTING-CONNECTOR.md). Use when someone asks to connect, set up, hook up, or send traces to Buildbox, provides a Buildbox endpoint or pairing code, or has a Buildbox connector key, no public endpoint, or wants Buildbox Testing to reach an agent that runs on a laptop, in a private network, or behind a chat channel.
+description: "Connect a customer's AI agent to Buildbox. Two jobs: send their production traces over OpenTelemetry (the default), or make their agent reachable for Buildbox Testing with the connector bridge (TESTING-CONNECTOR.md). Use when someone asks to connect, set up, hook up, or send traces to Buildbox, provides a Buildbox endpoint or pairing code, or has a Buildbox connector key, no public endpoint, or wants Buildbox Testing to reach an agent that runs on a laptop, in a private network, or behind a chat channel."
 ---
 
 # Connect an agent to Buildbox
